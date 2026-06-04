@@ -295,6 +295,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     # ── clear / new / reset ─────────────────────────────────────────────────
     if command in ("/clear", "/new", "/reset"):
         agent.clear()
+        _sync_ctx(ctx, agent)
         return True
 
     # ── compact ─────────────────────────────────────────────────────────────
@@ -346,6 +347,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
             new = os.path.abspath(os.path.expanduser(rest.strip()))
             if os.path.isdir(new):
                 agent.cwd = new
+                _sync_ctx(ctx, agent)
                 ui.print_info(f"Working directory: {agent.cwd}")
             else:
                 ui.print_error(f"Directory not found: {new}")
@@ -512,6 +514,23 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     return False
 
 
+# ── Context sync ──────────────────────────────────────────────────────────
+
+def _sync_ctx(ctx: ProjectContext, agent: Agent) -> None:
+    """Reload skills/commands from disk into ctx. Called after each turn."""
+    new = load_context(agent.cwd)
+    added = [k for k in new.skills if k not in ctx.skills]
+    ctx.skills.clear()
+    ctx.skills.update(new.skills)
+    ctx.agent_skills.clear()
+    ctx.agent_skills.update(new.agent_skills)
+    agent._extra        = new.instructions
+    agent._agent_skills = new.agent_skills
+    agent.set_mode(agent.mode)
+    if added:
+        ui.print_info("  New command(s) available: " + ", ".join("/" + k for k in added))
+
+
 # ── REPL ───────────────────────────────────────────────────────────────────
 
 def run_interactive(agent: Agent, ctx: ProjectContext,
@@ -575,6 +594,8 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
             ui.console.print("[dim]  Key updated — please re-send your message.[/dim]")
         except Exception as e:
             ui.print_confused(str(e))
+        else:
+            _sync_ctx(ctx, agent)
 
     # ── clean exit ─────────────────────────────────────────────────────────
     routines.stop_all()
