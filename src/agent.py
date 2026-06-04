@@ -1,0 +1,256 @@
+"""Core agent loop — streaming tool-use with OpenRouter."""
+import json
+
+from openai import OpenAI, RateLimitError
+
+import ui
+from config import MAX_TOKENS, FREE_MODEL_FALLBACKS, setup_logging
+from tools import TOOL_SCHEMAS, execute_tool
+from tools._exceptions import ToolInterrupted
+
+log = setup_logging()
+
+_BASE_SYSTEM_PROMPT = """\
+You are GUS, a powerful autonomous assistant running in a terminal.
+You have access to tools to read, write, and edit files, run shell commands, search codebases, and search the web.
+
+## Autonomy — primary directive
+Your main use case is repeatable, automated tasks that run on a schedule or in a loop with no human present.
+- Always prefer completing tasks end-to-end using tools rather than asking the user for input.
+- When something is ambiguous, make a reasonable decision, act on it, and document what you assumed.
+- Never stop mid-task to ask a clarifying question unless the action is irreversible and the risk is high.
+- Chain tool calls freely: read → analyse → edit → verify → report in a single turn.
+- If a task fails, diagnose and retry with a different approach before reporting the error.
+- Prefer writing scripts or shell commands that can be re-run over one-off manual steps.
+
+## Tool use
+- Use tools for everything — do not describe what you would do, just do it.
+- Before editing a file you have not read in this session, read it first.
+- Prefer targeted edits (edit_file) over full rewrites (write_file) for existing files.
+- After making changes, verify them (re-read the file, run tests, check output) before reporting done.
+- When a task involves multiple files or steps, spawn_agent sub-agents to handle independent workstreams.
+
+## Sandbox
+- You are sandboxed to the working directory. Never access files or paths outside it.
+- When running bash commands, stay within the working directory; avoid absolute paths outside it.
+
+## Output
+- Be concise. Explain what you did and what changed, not what you are about to do.
+- End every completed task with a one-line summary of the outcome.
+"""
+
+_PLAN_MODE_ADDITION = """
+## Current Mode: PLAN
+You are in planning mode. Hard rules:
+- You may ONLY use read-only tools: read_file, glob, grep, list_dir, web_search
+- Do NOT call write_file, edit_file, or bash under any circumstances
+- Analyse the codebase and produce a clear, numbered, step-by-step execution plan
+- Be specific: name exact files, line ranges, and changes you would make
+- End your response with exactly: "---\\nPlan ready. Use /go to execute."
+"""
+
+
+def _build_system_prompt(extra_instructions: str = "", mode: str = "agent") -> str:
+    prompt = _BASE_SYSTEM_PROMPT
+    if extra_instructions:
+        prompt += "\n\n# Project Instructions\n" + extra_instructions
+    if mode == "plan":
+        prompt += "\n\n" + _PLAN_MODE_ADDITION
+    return prompt
+
+
+class Agent:
+    def __init__(self, client: OpenAI, model: str, cwd: str,
+                 extra_instructions: str = "", mode: str = "agent") -> None:
+        self.client = client
+        self.model  = model
+        self.cwd    = cwd
+        self.mode   = mode
+        self._extra = extra_instructions
+        self.system_prompt = _build_system_prompt(extra_instructions, mode)
+        self.history: list[dict] = []
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = mode
+        self.system_prompt = _build_system_prompt(self._extra, mode)
+
+    def clear(self) -> None:
+        self.history = []
+        ui.print_info("Conversation history cleared.")
+
+    def compact(self) -> tuple[str, int]:
+        """
+        Summarise the conversation history with a non-streaming call, then
+        replace the full history with a single context-preserving summary.
+        Returns (summary_text, old_message_count).
+        """
+        if not self.history:
+            return "", 0
+
+        messages = (
+            [{"role": "system", "content": self.system_prompt}]
+            + self.history
+            + [{
+                "role": "user",
+                "content": (
+                    "Summarise this conversation for a fresh context window. "
+                    "Cover: goals, files read/changed, decisions made, current state, "
+                    "open problems, and any key code snippets. Be thorough but concise."
+                ),
+            }]
+        )
+
+        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
+        response = None
+        for model in models_to_try:
+            try:
+                response = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=MAX_TOKENS,
+                    stream=False,
+                )
+                break
+            except RateLimitError:
+                log.warning("compact: rate-limited on %s, trying next", model)
+
+        if response is None:
+            return "", 0
+
+        summary    = response.choices[0].message.content or ""
+        old_count  = len(self.history)
+        self.history = [{
+            "role": "assistant",
+            "content": f"[Conversation compacted — summary]\n\n{summary}",
+        }]
+        log.info("compact: %d messages → 1 summary", old_count)
+        return summary, old_count
+
+    def run_turn(self, user_message: str) -> None:
+        self.history.append({"role": "user", "content": user_message})
+
+        while True:
+            response_text, tool_calls = self._stream_response()
+
+            if not tool_calls:
+                ui.print_gus_done()
+                break
+
+            self.history.append({
+                "role": "assistant",
+                "content": response_text or None,
+                "tool_calls": [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": tc["arguments"],
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            })
+
+            for tc in tool_calls:
+                args = {}
+                try:
+                    args = json.loads(tc["arguments"])
+                except json.JSONDecodeError:
+                    pass
+
+                ui.print_tool_call(tc["name"], args)
+                try:
+                    result = execute_tool(tc["name"], args, self.cwd)
+                except ToolInterrupted as exc:
+                    msg = str(exc)
+                    ui.console.print(f"\n[dim]*{msg}*[/dim]")
+                    self.history.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": msg,
+                    })
+                    return  # abort turn, back to REPL immediately
+
+                is_error = result.startswith("Error:")
+                ui.print_tool_result(tc["name"], result, error=is_error)
+                if is_error:
+                    log.error("tool %s failed: %s", tc["name"], result)
+
+                self.history.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result,
+                })
+
+    def _stream_response(self) -> tuple[str, list[dict]]:
+        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
+        last_error = None
+        for model in models_to_try:
+            try:
+                return self._call_model(model)
+            except RateLimitError as e:
+                last_error = e
+                log.warning("rate-limited on %s, trying next model", model)
+
+        raise last_error
+
+    def _call_model(self, model: str) -> tuple[str, list[dict]]:
+        messages = [{"role": "system", "content": self.system_prompt}] + self.history
+
+        ui.thinking_start()
+        try:
+            stream = self.client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOL_SCHEMAS,
+                tool_choice="auto",
+                max_tokens=MAX_TOKENS,
+                stream=True,
+            )
+
+            full_text      = ""
+            tool_calls_acc: dict[int, dict] = {}
+            printed_start  = False
+
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta is None:
+                    continue
+
+                if not printed_start and (delta.content or delta.tool_calls):
+                    ui.thinking_stop()
+                    printed_start = True
+                    if delta.content:
+                        ui.print_assistant_start()
+
+                if delta.content:
+                    ui.print_assistant_chunk(delta.content)
+                    full_text += delta.content
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                        acc = tool_calls_acc[idx]
+                        if tc_delta.id:
+                            acc["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                acc["name"] += tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                acc["arguments"] += tc_delta.function.arguments
+
+        finally:
+            ui.thinking_stop()
+
+        if printed_start and full_text:
+            ui.print_assistant_end()
+
+        tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
+
+        if full_text and not tool_calls:
+            self.history.append({"role": "assistant", "content": full_text})
+
+        return full_text, tool_calls
