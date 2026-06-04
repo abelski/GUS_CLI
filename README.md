@@ -1,6 +1,6 @@
 # GUS 🦆
 
-**G**eneral-purpose **U**tility **S**hell — a terminal coding agent powered by [OpenRouter](https://openrouter.ai).
+**G**eneral-purpose **U**tility **S**hell — a terminal AI CLI agent powered by [OpenRouter](https://openrouter.ai) models.
 
 GUS chains tools end-to-end to complete tasks autonomously: reads files, edits code, runs shell commands, searches the web — without stopping to ask questions mid-task. Built for repeatable, scheduled, or looped workflows where no human is present.
 
