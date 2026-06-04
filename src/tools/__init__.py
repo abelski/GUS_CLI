@@ -1,9 +1,23 @@
 """Tools package — collects schemas and routes execute_tool() calls."""
 from typing import Any
 from ._exceptions import ToolInterrupted
-from . import read_file, write_file, edit_file, bash, glob, grep, list_dir, web_search, spawn_agent, monitor
+from . import (
+    read_file, write_file, edit_file, bash, glob, grep, list_dir,
+    web_search, web_fetch,
+    spawn_agent, monitor,
+    todo_write,
+    task_create, task_list, task_get, task_update,
+    ask_user,
+)
 
-_TOOLS = [read_file, write_file, edit_file, bash, glob, grep, list_dir, web_search, spawn_agent, monitor]
+_TOOLS = [
+    read_file, write_file, edit_file, bash, glob, grep, list_dir,
+    web_search, web_fetch,
+    spawn_agent, monitor,
+    todo_write,
+    task_create, task_list, task_get, task_update,
+    ask_user,
+]
 
 TOOL_SCHEMAS: list[dict] = [t.SCHEMA for t in _TOOLS]
 

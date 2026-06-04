@@ -3,20 +3,33 @@ import getpass
 import json
 import random
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 from rich import box
 
-console = Console()
+# highlight=False: let Markdown handle its own colouring; prevents Rich's
+# auto-highlighter from recolouring table cell content mid-render.
+console = Console(highlight=False)
+
+
+def _md(text: str) -> Padding:
+    """Render markdown with a consistent code theme, left-indented for readability."""
+    return Padding(
+        Markdown(text, code_theme="monokai", hyperlinks=False),
+        pad=(0, 0, 0, 2),
+    )
 
 # ── Thinking spinner ───────────────────────────────────────────────────────
 
 _active_status: Status | None = None
 
 _SPINNER_PHRASES = [
-    "🦆 *adjusts cap, squints*",
+    "🦆 *squints intensely*",
     "🦆 *aggressive eye contact*",
     "🦆 *waddling circles around the problem*",
     "🦆 *ruffles feathers thoughtfully*",
@@ -54,16 +67,13 @@ def _duck(mood: str = "normal") -> Text:
     Render the GUS mascot in one of several moods.
     Uses Rich Text objects so backslashes are always literal characters.
     """
-    CAP_TOP  = "bold white on blue"
-    CAP_RIM  = "bold blue"
-    BILL     = "bold dark_orange"
-    Y        = "bold yellow"
-    y        = "yellow"
-    BK       = "bold orange3"
-    BLACK    = "bold black"
-    RED      = "bold red"
-    GREEN    = "bold green"
-    TILDE    = "bold cyan"
+    F     = "bold yellow"                  # solid fill blocks: ▄ ▀ █
+    FB    = "on yellow"                    # yellow bg for interior spaces
+    EY    = "bold black on yellow"         # normal eyes
+    BL    = "bold dark_orange on yellow"   # bill / beak detail
+    RED   = "bold red on yellow"           # staring / confused accents
+    GRN   = "bold green on yellow"         # celebrating
+    TILDE = "bold cyan"                    # water / wind waves (outside body)
 
     def row(*parts) -> Text:
         t = Text()
@@ -71,74 +81,77 @@ def _duck(mood: str = "normal") -> Text:
             t.append(txt, style=style)
         return t
 
-    cap = [
-        row(("     _______",              CAP_RIM)),
-        row(("    [", CAP_RIM), ("=======", CAP_TOP), ("]", CAP_RIM)),
-        row(("    [_______]",             CAP_RIM), ("--", BILL)),
-    ]
+    # Shared structural pieces (interior = 13 chars between █ edges)
+    TOP = ("   ▄▄▄▄▄▄▄▄▄▄▄▄▄ ", F)
+    BOT = ("   ▀▀▀▀▀▀▀▀▀▀▀▀▀ ", F)
+    LE  = ("  █", F)
+    RE  = ("█",  F)
 
     moods: dict[str, list] = {
 
-        "normal": cap + [
-            row(("   /  ", Y), ("O", BLACK), ("     ", Y), ("O", BLACK), ("  \\", Y)),
-            row(("  (    ", Y), ("=====",    BK),           ("    )", Y)),
-            row(("  (             )", Y)),
-            row(("   '-----------'", y)),
+        "normal": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("◉", EY), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("▬▬▬▬▬", BL), ("      ", FB), RE),
+            row(LE, ("             ", FB), RE),
+            row(BOT),
         ],
 
-        "staring": cap + [
-            row(("   /  ", Y), ("◉", RED),  ("     ", Y), ("◉", RED),  ("  \\", Y)),
-            row(("  (  ", Y),  (">:===:<",   RED),         ("  )", Y)),
-            row(("  (             )", Y)),
-            row(("   '-----------'", y)),
+        "staring": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", RED), ("     ", FB), ("◉", RED), ("    ", FB), RE),
+            row(LE, ("  ", FB), (">:===:<", RED), ("    ", FB), RE),
+            row(LE, ("             ", FB), RE),
+            row(BOT),
         ],
 
-        "gusing": cap + [
-            row(("   /  ", Y), ("O", BLACK), ("     ", Y), ("O", BLACK), ("  \\", Y)),
-            row(("  ( ", Y),   ("=GUS!=",  BK),          (" )", Y)),
-            row(("  (    *   *   *  )", Y)),
-            row(("   '-----------'", y)),
+        "gusing": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("◉", EY), ("    ", FB), RE),
+            row(LE, ("   ", FB), ("=GUS!=", BL), ("    ", FB), RE),
+            row(LE, ("  *   *   *  ", BL), RE),
+            row(BOT),
         ],
 
-        "celebrating": cap + [
-            row(("   /  ", Y), ("^", GREEN), ("     ", Y), ("^", GREEN), ("  \\", Y)),
-            row(("  (    ", Y), ("~~~~~",    GREEN),        ("    )", Y)),
-            row(("  ( * ", Y), ("HOORAY",    "bold green"), (" * )", Y)),
-            row(("   '-----------'", y)),
+        "celebrating": [
+            row(TOP),
+            row(LE, ("  ", FB), ("^", GRN), ("     ", FB), ("^", GRN), ("    ", FB), RE),
+            row(LE, ("    ", FB), ("~~~~~", GRN), ("    ", FB), RE),
+            row(LE, (" * HOORAY *  ", GRN), RE),
+            row(BOT),
         ],
 
-        "confused": cap + [
-            row(("   /  ", Y), ("O", BLACK), ("     ", Y), ("?", "bold magenta"), ("  \\", Y)),
-            row(("  (    ", Y), ("====?",    BK),           ("    )", Y)),
-            row(("  (   ???   ???  )", "bold magenta")),
-            row(("   '-----------'", y)),
+        "confused": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("?", RED), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("====?", BL), ("      ", FB), RE),
+            row(LE, ("  ???   ???  ", RED), RE),
+            row(BOT),
         ],
 
         "flying": [
-            row(("        _______",              CAP_RIM)),
-            row(("       [", CAP_RIM), ("=======", CAP_TOP), ("]", CAP_RIM)),
-            row(("       [_______]",             CAP_RIM), ("--", BILL)),
-            row(("  ", TILDE), ("~~~", TILDE), ("/  ", Y), ("o", BLACK), ("   ", Y), ("o", BLACK), ("  \\", Y), ("~~~", TILDE)),
-            row((" ", TILDE), ("(", TILDE), ("( ", Y), ("flap flap",  "bold yellow"), (" )", Y), (")", TILDE)),
-            row(("  ", TILDE), ("~~~", TILDE), ("(   ~~~~  )", Y), ("~~~", TILDE)),
-            row(("        '---------'",  y)),
+            row(("   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄", F)),
+            row(("~~~", TILDE), ("█", F), ("  ", FB), ("o", EY), ("     ", FB), ("o", EY), ("    ", FB), ("█", F), ("~~~", TILDE)),
+            row(("~~(", TILDE), ("█", F), ("  ", FB), ("flap flap", "bold black on yellow"), ("  ", FB), ("█", F), (")~~", TILDE)),
+            row(("~~~", TILDE), ("█", F), ("    ", FB), ("~~~~", "bold cyan on yellow"), ("     ", FB), ("█", F), ("~~~", TILDE)),
+            row(("   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀", F)),
         ],
 
         "diving": [
-            row(("   '-----------'", y)),
-            row(("  (             )", Y)),
-            row(("  (    =====    )", Y)),
-            row(("   /  O     O  \\", Y)),
-            row(("    [_______]",     CAP_RIM), ("--", BILL)),
-            row(("    [", CAP_RIM), ("=======", CAP_TOP), ("]", CAP_RIM)),
-            row(("  ~~~", TILDE), ("_______", CAP_RIM), ("~~~", TILDE)),
+            row(BOT),
+            row(LE, ("             ", FB), RE),
+            row(LE, ("  ", FB), ("▬▬▬▬▬", BL), ("      ", FB), RE),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("◉", EY), ("    ", FB), RE),
+            row(TOP),
+            row(("  ~~~~~~~~~~~~~~~", TILDE)),
         ],
 
-        "sleeping": cap + [
-            row(("   /  ", Y), ("-", BLACK), ("     ", Y), ("-", BLACK), ("  \\", Y)),
-            row(("  (    ", Y), ("=====",    BK),           ("    )", Y)),
-            row(("  (    ", Y), ("z z z",    "dim white"),  ("    )", Y)),
-            row(("   '-----------'", y)),
+        "sleeping": [
+            row(TOP),
+            row(LE, ("  ", FB), ("─", EY), ("     ", FB), ("─", EY), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("▬▬▬▬▬", BL), ("      ", FB), RE),
+            row(LE, ("  ", FB), ("z z z", "dim white on yellow"), ("      ", FB), RE),
+            row(BOT),
         ],
 
     }
@@ -181,27 +194,60 @@ _TOOL_FLAVOR: dict[str, tuple[str, str]] = {
     "glob":       ("🔍", random.choice(["*sniffing around dirs*",  "*waddling through paths*","*scouting the pond*"])),
     "grep":       ("👃", random.choice(["*sniffing for pattern*",  "*tracking the scent*",    "*hunting through files*"])),
     "list_dir":   ("👀", random.choice(["*peeking inside*",        "*craning neck*",          "*nosy duck is nosy*"])),
-    "monitor":    ("🔭", random.choice(["*staring intensely*",     "*standing very still*",   "*refusing to blink*"])),
-    "spawn_agent":("🤖", random.choice(["*summoning a colleague*", "*delegating with authority*", "*cloning self*"])),
+    "monitor":      ("🔭", random.choice(["*staring intensely*",     "*standing very still*",   "*refusing to blink*"])),
+    "spawn_agent":  ("🤖", random.choice(["*summoning a colleague*", "*delegating with authority*", "*cloning self*"])),
+    "web_fetch":    ("🌐", random.choice(["*paddling to the URL*",   "*fetching from the pond*", "*reading the web*"])),
+    "todo_write":   ("📋", random.choice(["*updating the list*",     "*checking things off*",    "*organising tasks*"])),
+    "task_create":  ("➕", random.choice(["*adding a task*",         "*quacking it down*",       "*noting it carefully*"])),
+    "task_list":    ("📋", random.choice(["*checking the board*",    "*reviewing progress*",     "*scanning tasks*"])),
+    "task_get":     ("🔎", random.choice(["*inspecting task*",       "*peering at details*",     "*reading the brief*"])),
+    "task_update":  ("✏️",  random.choice(["*updating task*",        "*editing the board*",      "*marking progress*"])),
+    "ask_user":     ("❓", random.choice(["*tilting head*",           "*needs clarification*",    "*peering at human*"])),
 }
 
 
 # ── Speaker labels ─────────────────────────────────────────────────────────
+
+_live_render: Live | None = None
+_live_text:   str = ""
+
 
 def print_user(message: str) -> None:
     console.print(f"\n[bold cyan]You[/bold cyan]  {message}")
 
 
 def print_assistant_start() -> None:
-    console.print("\n[bold yellow]GUS[/bold yellow] ", end="")
+    global _live_render, _live_text
+    console.print("\n[bold yellow]GUS[/bold yellow]")
+    _live_text = ""
+    _live_render = Live(
+        _md(""),
+        console=console,
+        vertical_overflow="visible",
+        refresh_per_second=8,
+    )
+    _live_render.start()
 
 
 def print_assistant_chunk(text: str) -> None:
-    console.print(text, end="", markup=False)
+    global _live_text
+    if _live_render is not None:
+        _live_text += text
+        _live_render.update(_md(_live_text))
+    else:
+        console.print(text, end="", markup=False)
 
 
 def print_assistant_end() -> None:
-    console.print()
+    global _live_render, _live_text
+    if _live_render is not None:
+        # Final render with complete text, then stop
+        _live_render.update(_md(_live_text))
+        _live_render.stop()
+        _live_render = None
+        _live_text = ""
+    else:
+        console.print()
 
 
 # ── Tool display ───────────────────────────────────────────────────────────
@@ -410,7 +456,7 @@ def get_bottom_toolbar(agent, routines) -> str:
 
 # ── Help ───────────────────────────────────────────────────────────────────
 
-def print_help(skills: dict | None = None) -> None:
+def print_help(skills: dict | None = None, agent_skills: dict | None = None) -> None:
     cmd_lines = ""
     if skills:
         rows = []
@@ -425,6 +471,10 @@ def print_help(skills: dict | None = None) -> None:
             tag_str = "  " + " ".join(tags) if tags else ""
             rows.append(f"  [cyan]/{s.name:<14}[/cyan] — {s.description}{tag_str}")
         cmd_lines = "\n\n[bold]Custom Commands[/bold]\n" + "\n".join(rows)
+
+    if agent_skills:
+        rows = [f"  [cyan]/{s.name:<14}[/cyan] — {s.description}" for s in agent_skills.values()]
+        cmd_lines += "\n\n[bold]Agent Skills[/bold]  [dim](agentskills.io)[/dim]\n" + "\n".join(rows)
 
     console.print(
         Panel(

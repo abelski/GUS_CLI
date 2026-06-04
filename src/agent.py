@@ -1,5 +1,7 @@
 """Core agent loop — streaming tool-use with OpenRouter."""
 import json
+import platform
+import sys
 
 from openai import OpenAI, RateLimitError
 
@@ -50,10 +52,33 @@ You are in planning mode. Hard rules:
 """
 
 
-def _build_system_prompt(extra_instructions: str = "", mode: str = "agent") -> str:
-    prompt = _BASE_SYSTEM_PROMPT
+def _platform_note() -> str:
+    system = platform.system()
+    if system == "Windows":
+        return (
+            "\n## Environment\n"
+            "OS: Windows. Use Windows-native shell commands (dir, type, copy, del, etc.) "
+            "instead of Unix commands (ls, cat, cp, rm). "
+            "Use backslashes for paths or prefer forward slashes which Python accepts on Windows. "
+            "Shell commands run in cmd.exe unless the user specifies PowerShell."
+        )
+    return f"\n## Environment\nOS: {system}."
+
+
+def _build_system_prompt(extra_instructions: str = "", mode: str = "agent",
+                          agent_skills: dict | None = None) -> str:
+    prompt = _BASE_SYSTEM_PROMPT + _platform_note()
     if extra_instructions:
         prompt += "\n\n# Project Instructions\n" + extra_instructions
+    if agent_skills:
+        lines = [
+            "## Available Agent Skills",
+            "The following skills are available. When a task matches a skill, "
+            "read the full SKILL.md at the listed path with read_file and follow its instructions.\n",
+        ]
+        for skill in agent_skills.values():
+            lines.append(f"- **{skill.name}**: {skill.description}  \n  SKILL.md: `{skill.path}`")
+        prompt += "\n\n" + "\n".join(lines)
     if mode == "plan":
         prompt += "\n\n" + _PLAN_MODE_ADDITION
     return prompt
@@ -61,18 +86,20 @@ def _build_system_prompt(extra_instructions: str = "", mode: str = "agent") -> s
 
 class Agent:
     def __init__(self, client: OpenAI, model: str, cwd: str,
-                 extra_instructions: str = "", mode: str = "agent") -> None:
-        self.client = client
-        self.model  = model
-        self.cwd    = cwd
-        self.mode   = mode
-        self._extra = extra_instructions
-        self.system_prompt = _build_system_prompt(extra_instructions, mode)
+                 extra_instructions: str = "", mode: str = "agent",
+                 agent_skills: dict | None = None) -> None:
+        self.client       = client
+        self.model        = model
+        self.cwd          = cwd
+        self.mode         = mode
+        self._extra       = extra_instructions
+        self._agent_skills = agent_skills or {}
+        self.system_prompt = _build_system_prompt(extra_instructions, mode, self._agent_skills)
         self.history: list[dict] = []
 
     def set_mode(self, mode: str) -> None:
         self.mode = mode
-        self.system_prompt = _build_system_prompt(self._extra, mode)
+        self.system_prompt = _build_system_prompt(self._extra, mode, self._agent_skills)
 
     def clear(self) -> None:
         self.history = []

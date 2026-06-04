@@ -201,7 +201,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     rest    = parts[1] if len(parts) > 1 else ""
 
     if command == "/help":
-        ui.print_help(ctx.skills)
+        ui.print_help(ctx.skills, ctx.agent_skills)
         return True
 
     if command == "/clear":
@@ -272,6 +272,14 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
             _run_command(cmd, rest, agent)
         return True
 
+    # Agent Skills (agentskills.io)
+    if name in ctx.agent_skills:
+        skill = ctx.agent_skills[name]
+        prompt = skill.body + (f"\n\n{rest}" if rest else "")
+        ui.print_user(prompt)
+        agent.run_turn(prompt)
+        return True
+
     return False
 
 
@@ -299,7 +307,15 @@ def run_interactive(agent: Agent, ctx: ProjectContext) -> None:
                 bottom_toolbar=toolbar,
             ).strip()
         except (KeyboardInterrupt, EOFError):
-            break  # Ctrl+C / Ctrl+D at the blank prompt → clean exit
+            try:
+                confirm = session.prompt(
+                    [("class:prompt", "\nExit GUS? [y/N] ")]
+                ).strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                confirm = "y"
+            if confirm in ("y", "yes"):
+                break
+            continue
 
         if not user_input:
             continue
@@ -491,13 +507,17 @@ def main() -> None:
     cwd   = os.path.abspath(os.path.expanduser(args.cwd))
     ctx   = load_context(cwd)
     agent = Agent(client=client, model=DEFAULT_MODEL, cwd=cwd,
-                  extra_instructions=ctx.instructions)
+                  extra_instructions=ctx.instructions,
+                  agent_skills=ctx.agent_skills)
 
     if ctx.instructions:
         ui.print_info(f"  Loaded agents.md ({len(ctx.instructions)} chars)")
     if ctx.skills:
         ui.print_info(f"  Loaded {len(ctx.skills)} command(s): "
                       + ", ".join("/" + s for s in ctx.skills))
+    if ctx.agent_skills:
+        ui.print_info(f"  Loaded {len(ctx.agent_skills)} agent skill(s): "
+                      + ", ".join("/" + s for s in ctx.agent_skills))
 
     if args.prompt:
         run_oneshot(agent, args.prompt)

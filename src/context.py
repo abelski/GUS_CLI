@@ -1,4 +1,4 @@
-"""Load agents.md, skills, and .gus/commands from the working directory."""
+"""Load agents.md, skills, .gus/commands, and Agent Skills from the working directory."""
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,9 +40,20 @@ Skill = Command
 
 
 @dataclass
+class AgentSkill:
+    """An Agent Skills spec-compliant skill loaded from a SKILL.md file."""
+    name: str
+    description: str
+    path: Path              # absolute path to the SKILL.md file
+    compatibility: str      # optional compatibility notes from frontmatter
+    body: str               # full markdown body (instructions)
+
+
+@dataclass
 class ProjectContext:
     instructions: str
     skills: dict[str, Command] = field(default_factory=dict)
+    agent_skills: dict[str, AgentSkill] = field(default_factory=dict)
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, str], str]:
@@ -81,6 +92,30 @@ def _load_commands_from_dir(directory: Path) -> dict[str, Command]:
     return commands
 
 
+def _load_agent_skills_from_dir(directory: Path) -> dict[str, "AgentSkill"]:
+    """Load Agent Skills (agentskills.io spec) from a directory of skill folders."""
+    skills: dict[str, AgentSkill] = {}
+    if not directory.is_dir():
+        return skills
+    for skill_dir in sorted(directory.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.is_file():
+            continue
+        raw          = skill_md.read_text(encoding="utf-8")
+        meta, body   = _parse_frontmatter(raw)
+        name         = meta.get("name", skill_dir.name).lower()
+        skills[name] = AgentSkill(
+            name          = name,
+            description   = meta.get("description", f"Agent skill: {name}"),
+            path          = skill_md.resolve(),
+            compatibility = meta.get("compatibility", ""),
+            body          = body,
+        )
+    return skills
+
+
 def load_context(cwd: str) -> ProjectContext:
     root = Path(cwd)
 
@@ -93,6 +128,12 @@ def load_context(cwd: str) -> ProjectContext:
     # skills/   — simple prompt-injection commands (legacy)
     # .gus/commands/ — full-featured commands (shell pre-step, loop cap, confirm)
     commands = _load_commands_from_dir(root / "skills")
-    commands.update(_load_commands_from_dir(root / ".gus"  / "commands"))
+    commands.update(_load_commands_from_dir(root / ".gus" / "commands"))
 
-    return ProjectContext(instructions=instructions, skills=commands)
+    # Agent Skills (agentskills.io spec): ~/.gus/skills/ and .gus/skills/
+    # Global skills load first; project-level overrides them.
+    agent_skills = _load_agent_skills_from_dir(Path.home() / ".gus" / "skills")
+    agent_skills.update(_load_agent_skills_from_dir(root / ".gus" / "skills"))
+
+    return ProjectContext(instructions=instructions, skills=commands,
+                         agent_skills=agent_skills)

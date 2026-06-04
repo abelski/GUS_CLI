@@ -31,3 +31,7 @@ Lithuanian-English-1000.md
 .idea/
 *.swp
 *.swo
+
+# Claude Code
+.claude/settings.local.json
+CLAUDE.md
