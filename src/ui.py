@@ -1,7 +1,10 @@
 """Terminal UI — GUS agent personality and rendering."""
+import contextlib
 import getpass
 import json
 import random
+import threading
+import time
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
@@ -15,6 +18,10 @@ from rich import box
 # highlight=False: let Markdown handle its own colouring; prevents Rich's
 # auto-highlighter from recolouring table cell content mid-render.
 console = Console(highlight=False)
+
+# Serialises all Rich Live/Status output so parallel sub-agents don't corrupt the display.
+console_lock = threading.Lock()
+_subagent_depth_lock = threading.Lock()
 
 
 def _md(text: str) -> Padding:
@@ -154,6 +161,39 @@ def _duck(mood: str = "normal") -> Text:
             row(BOT),
         ],
 
+        # ── dancing frames (cycle dance1→dance4) ──────────────────────────
+        "dance1": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("◉", EY), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("▬♪▬▬▬", BL), ("      ", FB), RE),
+            row(LE, ("  ", FB), ("♫   ♩  ♪   ", "bold magenta on yellow"), RE),
+            row(BOT),
+        ],
+
+        "dance2": [
+            row(("\\", "bold magenta"), TOP),
+            row(LE, ("  ", FB), ("★", "bold magenta on yellow"), ("     ", FB), ("★", "bold magenta on yellow"), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("▬▬♫▬▬", BL), ("      ", FB), RE),
+            row(LE, ("  ", FB), ("♩  ♪  ♫    ", "bold magenta on yellow"), RE),
+            row(BOT),
+        ],
+
+        "dance3": [
+            row(TOP),
+            row(LE, ("  ", FB), ("◉", EY), ("     ", FB), ("◉", EY), ("    ", FB), RE),
+            row(LE, ("   ", FB), ("▬▬▬▬♪", BL), ("     ", FB), RE),
+            row(LE, (" ", FB), ("♪   ♩  ♫    ", "bold magenta on yellow"), RE),
+            row(BOT),
+        ],
+
+        "dance4": [
+            row(("/", "bold magenta"), TOP),
+            row(LE, ("  ", FB), ("^", "bold magenta on yellow"), ("     ", FB), ("^", "bold magenta on yellow"), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("~~~♬~~~", "bold magenta on yellow"), ("    ", FB), RE),
+            row(LE, ("  ", FB), ("♪ ♫  ♩ ♪   ", "bold magenta on yellow"), RE),
+            row(BOT),
+        ],
+
     }
 
     rows = moods.get(mood, moods["normal"])
@@ -163,6 +203,118 @@ def _duck(mood: str = "normal") -> Text:
         if i < len(rows) - 1:
             result.append("\n")
     return result
+
+
+# ── Dancing loading screen ────────────────────────────────────────────────
+
+_DANCE_FRAMES = ["dance1", "dance2", "dance3", "dance4"]
+
+# ── Hello splash ──────────────────────────────────────────────────────────
+
+_HELLO_PHRASES = [
+    "you had me at hello.",                            # Jerry Maguire
+    "to infinity and beyond!",                         # Toy Story
+    "just keep swimming.",                             # Finding Nemo
+    "adventure is out there!",                         # Up
+    "I am Groot.",                                     # Guardians of the Galaxy
+    "why so serious?",                                 # The Dark Knight
+    "I'll be back.",                                   # Terminator
+    "may the Force be with you.",                      # Star Wars
+    "you is kind, you is smart, you is important.",    # The Help
+    "hakuna matata.",                                  # The Lion King
+    "I volunteer as tribute!",                         # The Hunger Games
+    "nobody puts Baby in a corner.",                   # Dirty Dancing
+    "life is like a box of chocolates.",               # Forrest Gump
+    "do or do not. there is no try.",                  # Star Wars
+    "you complete me.",                                # Jerry Maguire
+    "I'm the king of the world!",                      # Titanic
+    "I'm kind of a big deal.",                         # Anchorman
+    "my precious.",                                    # The Lord of the Rings
+    "with great power comes great responsibility.",    # Spider-Man
+    "you can't handle the truth!",                     # A Few Good Men
+]
+
+
+def _speech_bubble(phrase: str) -> Text:
+    """Comic-style speech bubble, tail pointing down toward the duck."""
+    inner_w = max(len(phrase), 26)
+    lpad    = (inner_w - len(phrase)) // 2
+    rpad    = inner_w - len(phrase) - lpad
+    tail_x  = inner_w // 2 + 1   # column of the ┬ / │ tail
+
+    top  = "  ╭" + "─" * (inner_w + 2) + "╮"
+    mid  = "  │ " + " " * lpad + phrase + " " * rpad + " │"
+    bot  = "  ╰" + "─" * tail_x + "┬" + "─" * (inner_w + 1 - tail_x) + "╯"
+    tail = " " * (tail_x + 3) + "│"
+
+    t = Text()
+    t.append(top  + "\n", style="bold white")
+    t.append(mid  + "\n", style="bold yellow")
+    t.append(bot  + "\n", style="bold white")
+    t.append(tail + "\n", style="bold white")
+    return t
+
+
+def print_hello_splash() -> None:
+    """Animated hello: dancing duck + comic speech bubble, then flies away."""
+    phrase = random.choice(_HELLO_PHRASES)
+    bubble = _speech_bubble(phrase)
+
+    # ── dancing phase ─────────────────────────────────────────────────────
+    with Live(console=console, refresh_per_second=5, transient=True) as live:
+        for i in range(12):
+            duck = _duck(_DANCE_FRAMES[i % len(_DANCE_FRAMES)])
+            body = Text()
+            body.append_text(bubble)
+            body.append_text(duck)
+            body.append(f"\n\n  \"{phrase}\"", style="bold yellow italic")
+            live.update(Panel(
+                body,
+                border_style="yellow",
+                box=box.ROUNDED,
+                title="[bold yellow]🦆 GUS says hi![/bold yellow]",
+            ))
+            time.sleep(0.2)
+
+    # ── flying-away phase (transient → vanishes cleanly) ──────────────────
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        body = Text(justify="center")
+        body.append_text(_duck("flying"))
+        body.append("\n\n  wheee!  🌟", style="bold cyan")
+        live.update(Panel(
+            body,
+            border_style="cyan",
+            box=box.ROUNDED,
+            title="[bold cyan]🦆 here we go![/bold cyan]",
+        ))
+        time.sleep(0.6)
+
+@contextlib.contextmanager
+def loading_dance(label: str = "Loading…"):
+    """Animate a dancing duck while a blocking operation runs, then vanish."""
+    stop = threading.Event()
+
+    def _run() -> None:
+        i = 0
+        with Live(console=console, refresh_per_second=5, transient=True) as live:
+            while not stop.is_set():
+                duck  = _duck(_DANCE_FRAMES[i % len(_DANCE_FRAMES)])
+                dots  = "●" * ((i % 3) + 1) + "○" * (3 - (i % 3))
+                body  = Text(justify="center")
+                body.append_text(duck)
+                body.append(f"\n\n  {label}  {dots}", style="bold yellow")
+                live.update(Panel(body, border_style="yellow", box=box.ROUNDED,
+                                  title="[bold yellow]🦆 GUS[/bold yellow]"))
+                i += 1
+                time.sleep(0.25)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        t.join(timeout=2)
 
 
 # ── Duck personality phrases ───────────────────────────────────────────────
@@ -314,6 +466,148 @@ def print_diving() -> None:
                         title="[bold cyan]🌊 searching...[/bold cyan]"))
 
 
+# ── Btw / side question ────────────────────────────────────────────────────
+
+def print_btw_result(question: str, answer: str) -> None:
+    console.print(Panel(
+        f"[dim italic]{question}[/dim italic]\n\n{answer}",
+        title="[bold cyan]💬 aside[/bold cyan]",
+        border_style="cyan",
+        box=box.SIMPLE,
+    ))
+
+
+# ── Usage / cost ────────────────────────────────────────────────────────────
+
+def print_usage(agent) -> None:
+    msgs      = len(agent.history)
+    in_tok    = agent.total_input_tokens
+    out_tok   = agent.total_output_tokens
+    total_tok = in_tok + out_tok
+    name_line = f"  Session: [bold]{agent.session_name}[/bold]\n" if agent.session_name else ""
+    goal_line = f"  Goal: [italic]{agent.goal}[/italic]\n" if agent.goal else ""
+    tok_line  = (
+        f"  Tokens in:  {in_tok:,}\n"
+        f"  Tokens out: {out_tok:,}\n"
+        f"  Total:      {total_tok:,}"
+        if total_tok else "  Token counts not available (model did not report usage)."
+    )
+    console.print(Panel(
+        f"{name_line}{goal_line}"
+        f"  Messages in history: {msgs}\n"
+        f"  Model: {agent.model}\n\n"
+        f"{tok_line}",
+        title="[bold yellow]📊 GUS — Usage[/bold yellow]",
+        border_style="yellow",
+        box=box.SIMPLE,
+    ))
+
+
+# ── Context window breakdown ────────────────────────────────────────────────
+
+def print_context(agent) -> None:
+    """Show current context usage by category + session API totals."""
+    stats = agent.context_stats()
+    total = stats["total"]
+
+    def pct(n: int) -> str:
+        return f"{n / total * 100:.0f}%" if total else "—"
+
+    def bar(n: int, width: int = 26) -> str:
+        filled = round(n / total * width) if total else 0
+        return "[yellow]" + "█" * filled + "[/yellow][dim]" + "░" * (width - filled) + "[/dim]"
+
+    tbl = Table(show_header=True, box=box.SIMPLE, padding=(0, 1),
+                show_edge=False, header_style="bold yellow")
+    tbl.add_column("Category",      style="cyan",  min_width=18)
+    tbl.add_column("Tokens",        style="white", justify="right", min_width=8)
+    tbl.add_column("%",             style="dim",   justify="right", min_width=5)
+    tbl.add_column("",              min_width=28)
+
+    rows = [
+        ("System prompt",    stats["system"]),
+        ("User messages",    stats["user"]),
+        ("Assistant output", stats["assistant"]),
+        ("Tool results",     stats["tool"]),
+    ]
+    for label, n in rows:
+        tbl.add_row(label, f"{n:,}", pct(n), bar(n))
+
+    tbl.add_section()
+    tbl.add_row("[bold]Total in context[/bold]", f"[bold]{total:,}[/bold]", "", "")
+
+    api_in  = agent.total_input_tokens
+    api_out = agent.total_output_tokens
+    cache_r = agent.total_cache_read_tokens
+    turns   = agent.total_turns
+    msgs    = len(agent.history)
+
+    api_tbl = Table(show_header=False, box=None, padding=(0, 1), show_edge=False)
+    api_tbl.add_column(style="cyan",  min_width=22)
+    api_tbl.add_column(style="white", justify="right")
+
+    api_tbl.add_row("API input tokens",     f"{api_in:,}"  if api_in  else "—")
+    api_tbl.add_row("API output tokens",    f"{api_out:,}" if api_out else "—")
+    if cache_r:
+        api_tbl.add_row("Cache reads",      f"{cache_r:,}")
+    api_tbl.add_row("Turns completed",      str(turns))
+    api_tbl.add_row("Messages in history",  str(msgs))
+    api_tbl.add_row("Model",                agent.model)
+
+    note = Text()
+    note.append("Context estimate  ", style="bold")
+    note.append("(chars ÷ 4 — approximate)", style="dim")
+
+    console.print(Panel(
+        note,
+        title="[bold yellow]📐 GUS — Context[/bold yellow]",
+        border_style="yellow",
+        box=box.SIMPLE,
+        subtitle="[dim]/compact to shrink[/dim]",
+    ))
+    console.print(tbl)
+    console.print("\n[bold yellow]Session API totals[/bold yellow]")
+    console.print(api_tbl)
+
+
+# ── Skills list ─────────────────────────────────────────────────────────────
+
+def print_skills_list(skills: dict | None = None, agent_skills: dict | None = None) -> None:
+    lines = []
+    if skills:
+        lines.append("[bold]Custom Commands[/bold]")
+        for s in skills.values():
+            tags = []
+            if s.shell:          tags.append("[dim]shell[/dim]")
+            if s.max_iterations > 1: tags.append(f"[dim]loop×{s.max_iterations}[/dim]")
+            if s.confirm:        tags.append("[dim]confirm[/dim]")
+            tag_str = "  " + " ".join(tags) if tags else ""
+            lines.append(f"  [cyan]/{s.name:<16}[/cyan] {s.description}{tag_str}")
+    if agent_skills:
+        lines.append("\n[bold]Agent Skills[/bold]  [dim](agentskills.io)[/dim]")
+        for s in agent_skills.values():
+            lines.append(f"  [cyan]/{s.name:<16}[/cyan] {s.description}")
+    if not lines:
+        lines.append("  No skills loaded.")
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold yellow]🦆 GUS — Skills[/bold yellow]",
+        border_style="yellow",
+        box=box.SIMPLE,
+    ))
+
+
+# ── Goal achieved ───────────────────────────────────────────────────────────
+
+def print_goal_achieved(goal: str) -> None:
+    console.print(Panel(
+        f"[bold green]✓[/bold green] {goal}",
+        title="[bold green]🎯 Goal achieved![/bold green]",
+        border_style="green",
+        box=box.ROUNDED,
+    ))
+
+
 # ── Compact ────────────────────────────────────────────────────────────────
 
 def print_compact_result(old_count: int, summary: str) -> None:
@@ -331,8 +625,10 @@ _subagent_depth = 0
 
 def print_subagent_start(task: str) -> None:
     global _subagent_depth
-    _subagent_depth += 1
-    console.rule(f"[bold magenta]🤖 Sub-agent #{_subagent_depth}: {task[:72]}[/bold magenta]",
+    with _subagent_depth_lock:
+        _subagent_depth += 1
+        depth = _subagent_depth
+    console.rule(f"[bold magenta]🤖 Sub-agent #{depth}: {task[:72]}[/bold magenta]",
                  style="magenta")
 
 
@@ -340,7 +636,8 @@ def print_subagent_end(failed: bool = False) -> None:
     global _subagent_depth
     label  = "[bold red]✗ Sub-agent failed[/bold red]" if failed else "[bold magenta]✓ Sub-agent done[/bold magenta]"
     console.rule(label, style="magenta dim")
-    _subagent_depth = max(0, _subagent_depth - 1)
+    with _subagent_depth_lock:
+        _subagent_depth = max(0, _subagent_depth - 1)
 
 
 # ── Mode indicator ─────────────────────────────────────────────────────────
@@ -397,17 +694,20 @@ def print_banner(model: str, working_dir: str, ctx=None, mode: str = "agent") ->
     # ── right column: tips + what's new ───────────────────────────────────
     right = Text(no_wrap=False, overflow="fold")
     right.append("Tips for getting started\n", style="bold yellow")
-    right.append("  /plan <task>   plan before executing\n",  style="dim")
-    right.append("  /go            execute the plan\n",       style="dim")
-    right.append("  /compact       compress conversation\n",  style="dim")
-    right.append("  /loop 1h …     schedule a routine\n",     style="dim")
-    right.append("  /help          all commands\n",           style="dim")
+    right.append("  /plan <task>    plan before executing\n",   style="dim")
+    right.append("  /go             execute the plan\n",        style="dim")
+    right.append("  /btw <q>        quick side question\n",     style="dim")
+    right.append("  /goal <cond>    loop until goal is met\n",  style="dim")
+    right.append("  /compact        compress conversation\n",   style="dim")
+    right.append("  /loop 1h …      schedule a routine\n",      style="dim")
+    right.append("  /usage          token usage & stats\n",     style="dim")
+    right.append("  /context        context window breakdown\n", style="dim")
+    right.append("  /help           all commands\n",            style="dim")
     right.append("\nWhat's new\n", style="bold yellow")
-    right.append("  spawn_agent tool for sub-tasks\n",        style="dim")
-    right.append("  /plan + /go mode for safer edits\n",      style="dim")
-    right.append("  Time-based routines (1h, 1d…)\n",         style="dim")
-    right.append("  /compact to save context\n",              style="dim")
-    right.append("  First-run API key setup\n",               style="dim")
+    right.append("  /btw, /goal, /model, /recap\n",             style="dim")
+    right.append("  /skills, /reload-skills\n",                 style="dim")
+    right.append("  /export, /copy, /rename, /usage\n",         style="dim")
+    right.append("  diff, code-review, security-review\n",      style="dim")
 
     # ── two-column grid with divider ───────────────────────────────────────
     grid = Table(
@@ -434,20 +734,23 @@ def get_bottom_toolbar(agent, routines) -> str:
     """Return a prompt_toolkit bottom toolbar string showing shortcuts and status."""
     from prompt_toolkit.formatted_text import HTML
 
-    mode_badge = " [plan mode]" if agent.mode == "plan" else ""
     n_msgs     = len(agent.history)
     n_routines = len(routines.timed) + len(routines.every_turn)
 
-    left  = " ? /help  ·  /plan  ·  /go  ·  /compact  ·  /loop  ·  /exit"
+    left  = " ? /help  ·  /plan  ·  /go  ·  /compact  ·  /loop  ·  /btw  ·  /goal  ·  /exit"
     right_parts = []
-    if mode_badge:
-        right_parts.append("📋 PLAN MODE")
+    if agent.session_name:
+        right_parts.append(agent.session_name)
+    if agent.mode == "plan":
+        right_parts.append("📋 PLAN")
+    if agent.goal:
+        short_goal = agent.goal[:30] + ("…" if len(agent.goal) > 30 else "")
+        right_parts.append(f"🎯 {short_goal}")
     if n_routines:
         right_parts.append(f"{n_routines} routine{'s' if n_routines > 1 else ''}")
     right_parts.append(f"{n_msgs} msg{'s' if n_msgs != 1 else ''}")
     right = "  ·  ".join(right_parts) + " "
 
-    # pad centre so right side is flush
     return HTML(
         f"<style fg='ansiyellow'>{left}</style>"
         f"<style fg='ansibrightblack'>{right}</style>"
@@ -478,16 +781,33 @@ def print_help(skills: dict | None = None, agent_skills: dict | None = None) -> 
 
     console.print(
         Panel(
-            "[bold]Built-in[/bold]\n"
+            "[bold]Conversation[/bold]\n"
             "  [cyan]/help[/cyan]                    — this message\n"
-            "  [cyan]/clear[/cyan]                   — clear conversation history\n"
+            "  [cyan]/clear[/cyan]  /new  /reset     — clear conversation history\n"
             "  [cyan]/compact[/cyan]                 — summarise history → single context message\n"
+            "  [cyan]/btw[/cyan] <question>          — ask a side question (no history change)\n"
+            "  [cyan]/recap[/cyan]                   — one-sentence session summary\n"
+            "  [cyan]/rename[/cyan] [name]           — name this session\n"
+            "  [cyan]/export[/cyan] [file.md]        — export conversation (clipboard or file)\n"
+            "  [cyan]/copy[/cyan]                    — copy last response to clipboard\n"
             r"  [cyan]/cwd[/cyan] \[path]             — show or change working directory" + "\n"
-            "  [cyan]/exit[/cyan]                   — quit\n\n"
+            "  [cyan]/exit[/cyan]  /quit             — quit\n\n"
+            "[bold]Model & Usage[/bold]\n"
+            "  [cyan]/model[/cyan] [name]            — show or switch model\n"
+            "  [cyan]/usage[/cyan]  /cost            — token usage and session stats\n"
+            "  [cyan]/context[/cyan]                 — context window breakdown by category\n\n"
             "[bold]Modes[/bold]\n"
             r"  [cyan]/plan[/cyan] \[task]            — plan mode: analyse only, no writes" + "\n"
             "  [cyan]/go[/cyan]                     — execute the current plan\n"
             "  [cyan]/agent[/cyan]                  — switch back to agent mode\n\n"
+            "[bold]Goal — autonomous loop until done[/bold]\n"
+            "  [cyan]/goal[/cyan] <condition>        — set a goal; GUS keeps working until met\n"
+            "  [cyan]/goal[/cyan]                    — show active goal\n"
+            "  [cyan]/goal[/cyan] clear              — cancel goal\n"
+            "  [dim]e.g. /goal all tests pass[/dim]\n\n"
+            "[bold]Skills[/bold]\n"
+            "  [cyan]/skills[/cyan]                  — list all loaded skills\n"
+            "  [cyan]/reload-skills[/cyan]           — rescan .gus/commands/ and .gus/skills/ from disk\n\n"
             "[bold]Loop & Routines[/bold]\n"
             r"  [cyan]/loop[/cyan] \[n] <prompt>      — repeat n times (default 3)" + "\n"
             r"  [cyan]/loop[/cyan] \[n] /<cmd>         — loop a command" + "\n"

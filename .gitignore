@@ -17,6 +17,7 @@ env/
 
 # GUS runtime files
 gus.log
+workspace/
 
 # Unrelated files
 Lithuanian-English-1000.md

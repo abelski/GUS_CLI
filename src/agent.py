@@ -1,4 +1,5 @@
 """Core agent loop — streaming tool-use with OpenRouter."""
+import concurrent.futures
 import json
 import platform
 import sys
@@ -32,9 +33,12 @@ Your main use case is repeatable, automated tasks that run on a schedule or in a
 - After making changes, verify them (re-read the file, run tests, check output) before reporting done.
 - When a task involves multiple files or steps, spawn_agent sub-agents to handle independent workstreams.
 
-## Sandbox
-- You are sandboxed to the working directory. Never access files or paths outside it.
-- When running bash commands, stay within the working directory; avoid absolute paths outside it.
+## Sandbox — strict file-creation rule
+- You are strictly sandboxed to the working directory. NEVER create, write, or move files to any path outside it.
+- ALL new files and directories must be created inside the working directory or its subdirectories.
+- When running bash commands, use relative paths. Never use absolute paths that point outside the working directory.
+- Redirections (`>`, `>>`), `mkdir`, `touch`, `tee`, `cp`, and `mv` that target paths outside the working directory are blocked by the sandbox and will return an error.
+- If you need a temporary file, create it inside the working directory (e.g. `./tmp/`).
 
 ## Output
 - Be concise. Explain what you did and what changed, not what you are about to do.
@@ -88,14 +92,27 @@ class Agent:
     def __init__(self, client: OpenAI, model: str, cwd: str,
                  extra_instructions: str = "", mode: str = "agent",
                  agent_skills: dict | None = None) -> None:
-        self.client       = client
-        self.model        = model
-        self.cwd          = cwd
-        self.mode         = mode
-        self._extra       = extra_instructions
+        self.client        = client
+        self.model         = model
+        self.cwd           = cwd
+        self.mode          = mode
+        self._extra        = extra_instructions
         self._agent_skills = agent_skills or {}
         self.system_prompt = _build_system_prompt(extra_instructions, mode, self._agent_skills)
         self.history: list[dict] = []
+
+        # session metadata
+        self.session_name: str = ""
+        self.goal: str | None  = None
+
+        # last assistant text response (for /copy)
+        self._last_response: str = ""
+
+        # cumulative token usage
+        self.total_input_tokens:  int = 0
+        self.total_output_tokens: int = 0
+        self.total_cache_read_tokens: int = 0
+        self.total_turns: int = 0
 
     def set_mode(self, mode: str) -> None:
         self.mode = mode
@@ -103,6 +120,7 @@ class Agent:
 
     def clear(self) -> None:
         self.history = []
+        self._last_response = ""
         ui.print_info("Conversation history cleared.")
 
     def compact(self) -> tuple[str, int]:
@@ -153,13 +171,104 @@ class Agent:
         log.info("compact: %d messages → 1 summary", old_count)
         return summary, old_count
 
+    def btw(self, question: str) -> str:
+        """Ask a side question using session context without adding to history."""
+        messages = (
+            [{"role": "system", "content": self.system_prompt}]
+            + self.history
+            + [{"role": "user",
+                "content": "[Side question — answer briefly, do not take any action]\n\n" + question}]
+        )
+        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
+        for model in models_to_try:
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=512,
+                    stream=False,
+                )
+                return resp.choices[0].message.content or ""
+            except RateLimitError:
+                log.warning("btw: rate-limited on %s, trying next", model)
+        return "Error: all models rate-limited."
+
+    def recap(self) -> str:
+        """Return a one-sentence summary of this session without modifying history."""
+        if not self.history:
+            return "Nothing has happened in this session yet."
+        return self.btw(
+            "Give exactly one sentence summarising what has been accomplished in this session. "
+            "Be specific about files changed, tasks done, or conclusions reached."
+        )
+
+    def context_stats(self) -> dict:
+        """Estimate current context token usage broken down by message category."""
+        def _est(text: str) -> int:
+            return max(1, len(text) // 4)
+
+        system_tok = _est(self.system_prompt)
+        user_tok = assistant_tok = tool_tok = 0
+
+        for msg in self.history:
+            role = msg.get("role", "")
+            content = msg.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") for c in content if isinstance(c, dict)
+                )
+            tool_calls_json = json.dumps(msg["tool_calls"]) if "tool_calls" in msg else ""
+            tokens = _est(content + tool_calls_json)
+            if role == "user":
+                user_tok += tokens
+            elif role == "assistant":
+                assistant_tok += tokens
+            elif role == "tool":
+                tool_tok += tokens
+
+        total = system_tok + user_tok + assistant_tok + tool_tok
+        return {
+            "system":    system_tok,
+            "user":      user_tok,
+            "assistant": assistant_tok,
+            "tool":      tool_tok,
+            "total":     total,
+        }
+
+    def _exec_tool(self, tc: dict) -> tuple[dict, str, bool]:
+        """Execute one tool call; returns (tc, result, was_interrupted)."""
+        args = {}
+        try:
+            args = json.loads(tc["arguments"])
+        except json.JSONDecodeError:
+            pass
+        log.debug("tool call: %s  args=%s", tc["name"], json.dumps(args))
+        ui.print_tool_call(tc["name"], args)
+        try:
+            result = execute_tool(tc["name"], args, self.cwd)
+        except ToolInterrupted as exc:
+            msg = str(exc)
+            ui.console.print(f"\n[dim]*{msg}*[/dim]")
+            log.debug("tool interrupted: %s", tc["name"])
+            return tc, msg, True
+        is_error = result.startswith("Error:")
+        ui.print_tool_result(tc["name"], result, error=is_error)
+        if is_error:
+            log.error("tool %s failed: %s", tc["name"], result)
+        else:
+            log.debug("tool result: %s  → %s", tc["name"], result[:200])
+        return tc, result, False
+
     def run_turn(self, user_message: str) -> None:
+        self.total_turns += 1
         self.history.append({"role": "user", "content": user_message})
 
         while True:
             response_text, tool_calls = self._stream_response()
 
             if not tool_calls:
+                if response_text:
+                    self._last_response = response_text
                 ui.print_gus_done()
                 break
 
@@ -179,36 +288,25 @@ class Agent:
                 ],
             })
 
-            for tc in tool_calls:
-                args = {}
-                try:
-                    args = json.loads(tc["arguments"])
-                except json.JSONDecodeError:
-                    pass
+            if len(tool_calls) == 1:
+                exec_results = [self._exec_tool(tool_calls[0])]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+                    futures = [executor.submit(self._exec_tool, tc) for tc in tool_calls]
+                    exec_results = [f.result() for f in futures]
 
-                ui.print_tool_call(tc["name"], args)
-                try:
-                    result = execute_tool(tc["name"], args, self.cwd)
-                except ToolInterrupted as exc:
-                    msg = str(exc)
-                    ui.console.print(f"\n[dim]*{msg}*[/dim]")
-                    self.history.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": msg,
-                    })
-                    return  # abort turn, back to REPL immediately
-
-                is_error = result.startswith("Error:")
-                ui.print_tool_result(tc["name"], result, error=is_error)
-                if is_error:
-                    log.error("tool %s failed: %s", tc["name"], result)
-
+            interrupted = False
+            for tc, result, was_interrupted in exec_results:
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result,
                 })
+                if was_interrupted:
+                    interrupted = True
+
+            if interrupted:
+                return
 
     def _stream_response(self) -> tuple[str, list[dict]]:
         models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
@@ -225,55 +323,68 @@ class Agent:
     def _call_model(self, model: str) -> tuple[str, list[dict]]:
         messages = [{"role": "system", "content": self.system_prompt}] + self.history
 
-        ui.thinking_start()
-        try:
-            stream = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                tool_choice="auto",
-                max_tokens=MAX_TOKENS,
-                stream=True,
-            )
+        # Start the HTTP request before acquiring the console lock so that
+        # parallel sub-agents can hit the API concurrently; only rendering is serialised.
+        stream = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=TOOL_SCHEMAS,
+            tool_choice="auto",
+            max_tokens=MAX_TOKENS,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
 
-            full_text      = ""
-            tool_calls_acc: dict[int, dict] = {}
-            printed_start  = False
+        full_text      = ""
+        tool_calls_acc: dict[int, dict] = {}
+        printed_start  = False
 
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
-                    continue
+        with ui.console_lock:
+            ui.thinking_start()
+            try:
+                for chunk in stream:
+                    # track token usage from the final usage chunk
+                    usage = getattr(chunk, "usage", None)
+                    if usage:
+                        self.total_input_tokens  += getattr(usage, "prompt_tokens",     0) or 0
+                        self.total_output_tokens += getattr(usage, "completion_tokens", 0) or 0
+                        # OpenAI-format cache: prompt_tokens_details.cached_tokens
+                        details = getattr(usage, "prompt_tokens_details", None)
+                        self.total_cache_read_tokens += (getattr(details, "cached_tokens", 0) or 0) if details else 0
 
-                if not printed_start and (delta.content or delta.tool_calls):
-                    ui.thinking_stop()
-                    printed_start = True
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta is None:
+                        continue
+
+                    if not printed_start and (delta.content or delta.tool_calls):
+                        ui.thinking_stop()
+                        printed_start = True
+                        if delta.content:
+                            ui.print_assistant_start()
+
                     if delta.content:
-                        ui.print_assistant_start()
+                        ui.print_assistant_chunk(delta.content)
+                        full_text += delta.content
 
-                if delta.content:
-                    ui.print_assistant_chunk(delta.content)
-                    full_text += delta.content
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
+                            acc = tool_calls_acc[idx]
+                            if tc_delta.id:
+                                acc["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    acc["name"] += tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    acc["arguments"] += tc_delta.function.arguments
 
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tool_calls_acc:
-                            tool_calls_acc[idx] = {"id": "", "name": "", "arguments": ""}
-                        acc = tool_calls_acc[idx]
-                        if tc_delta.id:
-                            acc["id"] = tc_delta.id
-                        if tc_delta.function:
-                            if tc_delta.function.name:
-                                acc["name"] += tc_delta.function.name
-                            if tc_delta.function.arguments:
-                                acc["arguments"] += tc_delta.function.arguments
+            finally:
+                ui.thinking_stop()
 
-        finally:
-            ui.thinking_stop()
-
-        if printed_start and full_text:
-            ui.print_assistant_end()
+            if printed_start and full_text:
+                ui.print_assistant_end()
 
         tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
 

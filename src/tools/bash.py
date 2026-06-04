@@ -1,6 +1,7 @@
 import subprocess
 
 from ._exceptions import ToolInterrupted
+from ._sandbox import bash_sandbox_check
 
 SCHEMA = {
     "type": "function",
@@ -9,7 +10,10 @@ SCHEMA = {
         "description": (
             "Execute a shell command and return its output. "
             "Use for running tests, installing packages, git operations, etc. "
-            "Working directory is the project root."
+            "Working directory is the project root. "
+            "IMPORTANT: commands must not create or write files outside the working directory. "
+            "Redirections, mkdir, touch, cp, mv, and tee targeting paths outside the working "
+            "directory are blocked by the sandbox."
         ),
         "parameters": {
             "type": "object",
@@ -27,6 +31,8 @@ SCHEMA = {
 
 
 def run(command: str, cwd: str, timeout: int = 30) -> str:
+    if err := bash_sandbox_check(command, cwd):
+        return err
     proc = None
     try:
         proc = subprocess.Popen(

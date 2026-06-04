@@ -6,7 +6,46 @@ GUS chains tools end-to-end to complete tasks autonomously: reads files, edits c
 
 ---
 
-## Quick start
+## Installation
+
+### Download a pre-built binary (recommended)
+
+No Python required. Download the binary for your platform from the [latest GitHub release](https://github.com/abelski/Agent/releases/latest):
+
+| Platform | File |
+|---|---|
+| macOS (Apple Silicon / Intel) | `gus-macos` |
+| Linux (x86-64) | `gus-linux` |
+| Windows | `gus-windows.exe` |
+
+**macOS / Linux — make it executable and run:**
+
+```bash
+chmod +x gus-macos   # or gus-linux
+./gus-macos
+```
+
+**Windows:**
+
+```
+gus-windows.exe
+```
+
+On first run GUS will ask for an [OpenRouter API key](https://openrouter.ai/keys) and save it to `~/.gus/.env`. Free models are available.
+
+To use GUS from anywhere, move the binary to a directory on your `PATH`:
+
+```bash
+# macOS / Linux
+sudo mv gus-macos /usr/local/bin/gus
+
+# then just run:
+gus
+```
+
+---
+
+### Run from source
 
 **Requirements:** Python 3.10+
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """GUS — CLI agent entry point."""
 import os
+import platform
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -15,14 +17,14 @@ from prompt_toolkit.styles import Style
 from openai import AuthenticationError
 
 import ui
-from config import get_client, DEFAULT_MODEL, WORKING_DIR
+from config import get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR
 from agent import Agent
 from context import load_context, ProjectContext, Command
 from loop import RoutineManager, parse_interval, interval_label
+from mcp_client import MCPManager
+from tools import register_mcp_tools
 
-# Project root is one level above src/
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_ENV_FILE     = os.path.join(_PROJECT_ROOT, ".env")
+_ENV_FILE = str(CONFIG_DIR / ".env")
 
 
 class _QuitSignal(Exception):
@@ -37,7 +39,7 @@ PROMPT_STYLE = Style.from_dict({"prompt": "bold ansicyan"})
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="GUS — AI coding assistant powered by OpenRouter",
+        description="GUS — AI assistant powered by OpenRouter",
     )
     parser.add_argument("prompt", nargs="?", help="One-shot prompt (non-interactive).")
     parser.add_argument("--cwd", default=WORKING_DIR,
@@ -128,19 +130,11 @@ def handle_loop(rest: str, agent: Agent, ctx: ProjectContext,
             ui.print_error(f"Usage: /loop {first} <prompt>")
             return
         prompt_text, cmd_obj, cmd_args = _resolve_prompt_or_cmd(tail, ctx, agent)
-        # For timed routines with shell commands, build the full prompt now
-        # and let the routine re-run the shell each time via agent.run_turn
         final_prompt = prompt_text
         if cmd_obj and cmd_obj.shell:
-            # wrap the command name so the routine re-executes shell each time
-            # we store a lambda-like closure prompt that does the full thing
-            # simplest: store a special marker and handle in routine body
-            # easier: pre-bake the current shell output — but that won't refresh
-            # best: store as Command and rebuild each fire → use a subclass-free approach
             final_prompt = f"__cmd__{cmd_obj.name}__{cmd_args}"
         r = routines.add_timed(final_prompt, interval)
         if cmd_obj:
-            # override with a proper runner in the thread body
             routines.timed[r.id]._cmd_obj  = cmd_obj   # type: ignore[attr-defined]
             routines.timed[r.id]._cmd_args = cmd_args  # type: ignore[attr-defined]
         lbl = interval_label(interval)
@@ -192,22 +186,118 @@ def _print_routines(routines: RoutineManager) -> None:
         )
 
 
+# ── Goal helpers ───────────────────────────────────────────────────────────
+
+def _check_goal_satisfied(agent: Agent) -> bool:
+    """Ask the model (non-history) whether the current goal has been met."""
+    if not agent.goal:
+        return True
+    answer = agent.btw(
+        f"Has this goal been achieved: \"{agent.goal}\"? "
+        "Look at the full conversation above and reply ONLY with YES or NO."
+    )
+    return answer.strip().upper().startswith("YES")
+
+
+def _run_goal_loop(agent: Agent, routines: RoutineManager) -> None:
+    """After a turn completes, auto-continue if goal is not yet satisfied."""
+    while agent.goal:
+        ui.print_info(f"  Checking goal: {agent.goal!r}")
+        try:
+            satisfied = _check_goal_satisfied(agent)
+        except Exception:
+            break
+        if satisfied:
+            ui.print_goal_achieved(agent.goal)
+            agent.goal = None
+            break
+        ui.print_info("  Goal not yet met — continuing…")
+        try:
+            with routines.acquire():
+                agent.run_turn(f"Continue working toward the goal: {agent.goal}")
+        except KeyboardInterrupt:
+            ui.console.print("\n[dim]*Goal loop interrupted — goal preserved. Use /goal clear to cancel.*[/dim]")
+            break
+        except Exception as e:
+            ui.print_confused(str(e))
+            break
+
+
+# ── Clipboard helper ───────────────────────────────────────────────────────
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Copy text to system clipboard. Returns True on success."""
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        elif system == "Windows":
+            subprocess.run(["clip"], input=text.encode("utf-16"), check=True)
+        else:
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"],
+                               input=text.encode(), check=True)
+            except FileNotFoundError:
+                subprocess.run(["xsel", "--clipboard", "--input"],
+                               input=text.encode(), check=True)
+        return True
+    except Exception:
+        return False
+
+
+# ── Export helper ──────────────────────────────────────────────────────────
+
+def _export_conversation(agent: Agent) -> str:
+    """Render conversation history as markdown text."""
+    lines = []
+    for msg in agent.history:
+        role    = msg["role"].upper()
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                c.get("text", "") for c in content if isinstance(c, dict)
+            )
+        if role == "TOOL":
+            lines.append(f"### TOOL RESULT\n\n```\n{content}\n```")
+        else:
+            lines.append(f"## {role}\n\n{content}")
+    return "\n\n---\n\n".join(lines)
+
+
+# ── MCP helper ────────────────────────────────────────────────────────────
+
+def _handle_mcp(mcp: "MCPManager | None") -> None:
+    if mcp is None or mcp.server_count == 0:
+        ui.print_info("  No MCP servers configured. Add servers to .gus/mcp.json.")
+        return
+    servers = mcp.list_servers()
+    ui.console.print("\n[bold yellow]MCP servers:[/bold yellow]")
+    for s in servers:
+        status = "[green]running[/green]" if s["running"] else "[red]stopped[/red]"
+        tools  = ", ".join(s["tools"]) if s["tools"] else "(no tools)"
+        ui.console.print(f"  [cyan]{s['name']}[/cyan]  {status}  —  {tools}")
+
+
 # ── Slash-command dispatcher ───────────────────────────────────────────────
 
 def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
-                         routines: RoutineManager) -> bool:
+                         routines: RoutineManager,
+                         mcp: "MCPManager | None" = None) -> bool:
     parts   = raw.strip().split(None, 1)
     command = parts[0].lower()
     rest    = parts[1] if len(parts) > 1 else ""
 
+    # ── help ────────────────────────────────────────────────────────────────
     if command == "/help":
         ui.print_help(ctx.skills, ctx.agent_skills)
         return True
 
-    if command == "/clear":
+    # ── clear / new / reset ─────────────────────────────────────────────────
+    if command in ("/clear", "/new", "/reset"):
         agent.clear()
         return True
 
+    # ── compact ─────────────────────────────────────────────────────────────
     if command == "/compact":
         ui.print_info("  Compacting conversation…")
         summary, count = agent.compact()
@@ -217,6 +307,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
             ui.print_info("  Nothing to compact.")
         return True
 
+    # ── plan / agent / go ───────────────────────────────────────────────────
     if command == "/plan":
         agent.set_mode("plan")
         ui.print_mode_change("plan")
@@ -238,9 +329,16 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
         agent.run_turn("Execute the plan you just described. Make all the changes now.")
         return True
 
+    # ── exit / quit ─────────────────────────────────────────────────────────
     if command in ("/exit", "/quit"):
         raise _QuitSignal()
 
+    # ── mcp — list MCP servers and tools ────────────────────────────────────
+    if command == "/mcp":
+        _handle_mcp(mcp)
+        return True
+
+    # ── cwd ─────────────────────────────────────────────────────────────────
     if command == "/cwd":
         if not rest:
             ui.print_info(f"Working directory: {agent.cwd}")
@@ -253,11 +351,142 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
                 ui.print_error(f"Directory not found: {new}")
         return True
 
+    # ── loop ────────────────────────────────────────────────────────────────
     if command == "/loop":
         handle_loop(rest, agent, ctx, routines)
         return True
 
-    # registered commands
+    # ── btw — side question, no history ─────────────────────────────────────
+    if command == "/btw":
+        if not rest:
+            ui.print_error("Usage: /btw <question>")
+            return True
+        ui.print_info("  Asking side question…")
+        answer = agent.btw(rest)
+        ui.print_btw_result(rest, answer)
+        return True
+
+    # ── model — switch or show model ─────────────────────────────────────────
+    if command == "/model":
+        if not rest:
+            ui.print_info(f"  Current model: {agent.model}")
+        else:
+            agent.model = rest.strip()
+            ui.print_info(f"  Model switched to: {agent.model}")
+        return True
+
+    # ── recap — one-line session summary ────────────────────────────────────
+    if command == "/recap":
+        ui.print_info("  Generating recap…")
+        summary = agent.recap()
+        ui.print_btw_result("Session recap", summary)
+        return True
+
+    # ── skills — list all skills ─────────────────────────────────────────────
+    if command == "/skills":
+        ui.print_skills_list(ctx.skills, ctx.agent_skills)
+        return True
+
+    # ── reload-skills — rescan skills from disk ──────────────────────────────
+    if command == "/reload-skills":
+        new_ctx = load_context(agent.cwd)
+        ctx.instructions = new_ctx.instructions
+        ctx.skills.clear()
+        ctx.skills.update(new_ctx.skills)
+        ctx.agent_skills.clear()
+        ctx.agent_skills.update(new_ctx.agent_skills)
+        # propagate to agent system prompt
+        agent._extra        = ctx.instructions
+        agent._agent_skills = ctx.agent_skills
+        agent.set_mode(agent.mode)  # rebuild system prompt with updated instructions/skills
+        ui.print_info(
+            f"  Reloaded — {len(ctx.skills)} command(s), "
+            f"{len(ctx.agent_skills)} agent skill(s)."
+        )
+        return True
+
+    # ── rename — label the session ───────────────────────────────────────────
+    if command == "/rename":
+        if not rest:
+            if agent.session_name:
+                ui.print_info(f"  Session name: {agent.session_name!r}")
+            else:
+                ui.print_info("  Session has no name. Usage: /rename <name>")
+        else:
+            agent.session_name = rest.strip()
+            ui.print_info(f"  Session renamed to: {agent.session_name!r}")
+        return True
+
+    # ── export — write conversation to file ──────────────────────────────────
+    if command == "/export":
+        text = _export_conversation(agent)
+        if not text:
+            ui.print_info("  Nothing to export.")
+            return True
+        if rest:
+            path = os.path.join(agent.cwd, rest.strip())
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                ui.print_info(f"  Exported to: {path}")
+            except OSError as e:
+                ui.print_error(f"Export failed: {e}")
+        else:
+            if _copy_to_clipboard(text):
+                ui.print_info("  Conversation copied to clipboard.")
+            else:
+                ui.print_error("Clipboard not available — pass a filename: /export <file.md>")
+        return True
+
+    # ── copy — copy last response to clipboard ───────────────────────────────
+    if command == "/copy":
+        if not agent._last_response:
+            ui.print_info("  No response to copy yet.")
+            return True
+        if _copy_to_clipboard(agent._last_response):
+            preview = agent._last_response[:80].replace("\n", " ")
+            ui.print_info(f"  Copied to clipboard: {preview!r}…")
+        else:
+            ui.print_error(
+                "Clipboard not available on this system. "
+                "Use /export <file.md> to save the conversation instead."
+            )
+        return True
+
+    # ── usage / cost — show token stats ──────────────────────────────────────
+    if command in ("/usage", "/cost", "/stats"):
+        ui.print_usage(agent)
+        return True
+
+    # ── context — show context window breakdown ───────────────────────────
+    if command == "/context":
+        ui.print_context(agent)
+        return True
+
+    # ── goal — set autonomous goal ───────────────────────────────────────────
+    if command == "/goal":
+        lower = rest.strip().lower()
+        if not rest:
+            if agent.goal:
+                ui.print_info(f"  Active goal: {agent.goal!r}")
+            else:
+                ui.print_info("  No active goal. Usage: /goal <condition>")
+        elif lower in ("clear", "stop", "off", "cancel", "none", "reset"):
+            if agent.goal:
+                ui.print_info(f"  Goal cleared: {agent.goal!r}")
+                agent.goal = None
+            else:
+                ui.print_info("  No active goal.")
+        else:
+            agent.goal = rest.strip()
+            ui.print_info(
+                f"  Goal set: {agent.goal!r}\n"
+                "  GUS will keep working after each turn until the goal is met.\n"
+                "  Press Ctrl+C to interrupt, or /goal clear to cancel."
+            )
+        return True
+
+    # ── registered custom commands ──────────────────────────────────────────
     name = command.lstrip("/")
     if name in ctx.skills:
         cmd = ctx.skills[name]
@@ -272,7 +501,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
             _run_command(cmd, rest, agent)
         return True
 
-    # Agent Skills (agentskills.io)
+    # ── Agent Skills (agentskills.io) ───────────────────────────────────────
     if name in ctx.agent_skills:
         skill = ctx.agent_skills[name]
         prompt = skill.body + (f"\n\n{rest}" if rest else "")
@@ -285,13 +514,15 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
 
 # ── REPL ───────────────────────────────────────────────────────────────────
 
-def run_interactive(agent: Agent, ctx: ProjectContext) -> None:
+def run_interactive(agent: Agent, ctx: ProjectContext,
+                    mcp: "MCPManager | None" = None) -> None:
     routines = RoutineManager(agent)
     session: PromptSession = PromptSession(
         history=FileHistory(HISTORY_FILE),
         auto_suggest=AutoSuggestFromHistory(),
         style=PROMPT_STYLE,
     )
+    ui.print_hello_splash()
     ui.print_banner(DEFAULT_MODEL, agent.cwd, ctx)
 
     while True:
@@ -322,7 +553,7 @@ def run_interactive(agent: Agent, ctx: ProjectContext) -> None:
 
         if user_input.startswith("/"):
             try:
-                if not handle_slash_command(user_input, agent, ctx, routines):
+                if not handle_slash_command(user_input, agent, ctx, routines, mcp=mcp):
                     ui.print_error(
                         f"Unknown command: {user_input.split()[0]}. Type /help."
                     )
@@ -334,6 +565,8 @@ def run_interactive(agent: Agent, ctx: ProjectContext) -> None:
         try:
             with routines.acquire():
                 agent.run_turn(user_input)
+            if agent.goal:
+                _run_goal_loop(agent, routines)
         except KeyboardInterrupt:
             ui.console.print("\n[dim]*interrupted — /exit to quit*[/dim]")
         except AuthenticationError:
@@ -442,7 +675,6 @@ def _ensure_env() -> None:
     If .env is missing or has no OPENROUTER_API_KEY, walk the user through
     creating one before the rest of the app starts.
     """
-    # Read existing .env (may not exist)
     existing_key = ""
     if os.path.isfile(_ENV_FILE):
         with open(_ENV_FILE, encoding="utf-8") as f:
@@ -519,10 +751,20 @@ def main() -> None:
         ui.print_info(f"  Loaded {len(ctx.agent_skills)} agent skill(s): "
                       + ", ".join("/" + s for s in ctx.agent_skills))
 
-    if args.prompt:
-        run_oneshot(agent, args.prompt)
-    else:
-        run_interactive(agent, ctx)
+    mcp = MCPManager(cwd)
+    with ui.loading_dance("Starting MCP servers"):
+        n_servers = mcp.start_all()
+    if n_servers:
+        n_tools = register_mcp_tools(mcp)
+        ui.print_info(f"  MCP: {n_servers} server(s), {n_tools} tool(s) available")
+
+    try:
+        if args.prompt:
+            run_oneshot(agent, args.prompt)
+        else:
+            run_interactive(agent, ctx, mcp=mcp)
+    finally:
+        mcp.stop_all()
 
 
 if __name__ == "__main__":
