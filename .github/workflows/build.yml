@@ -57,14 +57,15 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv artifacts/gus-macos/gus  artifacts/gus-macos
-          mv artifacts/gus-linux/gus  artifacts/gus-linux
-          mv artifacts/gus-windows/gus.exe artifacts/gus-windows.exe
+          mkdir -p release
+          mv artifacts/gus-macos/gus       release/gus-macos
+          mv artifacts/gus-linux/gus       release/gus-linux
+          mv artifacts/gus-windows/gus.exe release/gus-windows.exe
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/gus-macos
-            artifacts/gus-linux
-            artifacts/gus-windows.exe
+            release/gus-macos
+            release/gus-linux
+            release/gus-windows.exe
