@@ -4,6 +4,11 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+try:
+    import yaml  # PyYAML — proper frontmatter parsing when available
+except ImportError:
+    yaml = None
+
 
 @dataclass
 class Command:
@@ -56,6 +61,39 @@ class ProjectContext:
     skills: dict[str, Command] = field(default_factory=dict)
     agent_skills: dict[str, AgentSkill] = field(default_factory=dict)
     skill_warnings: list[str] = field(default_factory=list)  # spec violations
+    fingerprint: tuple = ()  # mtime signature of the sources, to skip no-op reloads
+
+
+def context_fingerprint(cwd: str) -> tuple:
+    """Cheap mtime signature of every file/dir load_context() reads.
+
+    Lets the REPL skip the full disk re-scan + system-prompt rebuild after turns
+    that didn't touch any skill/command source.
+    """
+    root = Path(cwd)
+    paths = [
+        root / "agents.md",
+        root / "skills",
+        root / ".gus" / "commands",
+        root / ".gus" / "skills",
+        Path(__file__).parent.parent / ".gus" / "skills",
+        Path.home() / ".gus" / "skills",
+    ]
+    sig: list = []
+    for p in paths:
+        try:
+            st = p.stat()
+            sig.append((str(p), st.st_mtime_ns))
+            # include child mtimes so new/edited files inside a dir are detected
+            if p.is_dir():
+                for child in sorted(p.rglob("*")):
+                    try:
+                        sig.append((str(child), child.stat().st_mtime_ns))
+                    except OSError:
+                        pass
+        except OSError:
+            sig.append((str(p), None))
+    return tuple(sig)
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
@@ -73,6 +111,17 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         return meta, text
     front = text[3:end].strip()
     body  = text[end + 4:].strip()
+
+    # Prefer a real YAML parser when present — handles lists (e.g. allowed-tools),
+    # quoted colons, and multi-line values that the fallback parser cannot.
+    if yaml is not None:
+        try:
+            parsed = yaml.safe_load(front)
+            if isinstance(parsed, dict):
+                return parsed, body
+        except yaml.YAMLError:
+            pass  # malformed YAML — fall back to the lenient line parser
+
     current_key: str | None = None
     for line in front.splitlines():
         if not line.strip():
@@ -98,16 +147,30 @@ def _load_commands_from_dir(directory: Path) -> dict[str, Command]:
     for md_file in sorted(directory.glob("*.md")):
         raw          = md_file.read_text(encoding="utf-8")
         meta, body   = _parse_frontmatter(raw)
-        name         = meta.get("name", md_file.stem).lower().replace(" ", "-")
+        name         = str(meta.get("name", md_file.stem)).lower().replace(" ", "-")
         commands[name] = Command(
             name           = name,
-            description    = meta.get("description", f"Run {name}"),
+            description    = str(meta.get("description", f"Run {name}")),
             prompt         = body,
-            shell          = meta.get("shell") or None,
-            confirm        = meta.get("confirm", "false").lower() == "true",
-            max_iterations = int(meta.get("max_iterations", "1")),
+            shell          = str(meta["shell"]) if meta.get("shell") else None,
+            confirm        = _as_bool(meta.get("confirm")),
+            max_iterations = _as_int(meta.get("max_iterations"), 1),
         )
     return commands
+
+
+def _as_bool(v) -> bool:
+    """Coerce a frontmatter value (yaml bool, or 'true'/'false' string) to bool."""
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("true", "1", "yes")
+
+
+def _as_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
 
 
 _NAME_RE = re.compile(r'^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$')
@@ -128,13 +191,13 @@ def _validate_skill(name: str, meta: dict, folder_name: str) -> list[str]:
     if name != folder_name:
         errors.append(f"name '{name}' does not match folder name '{folder_name}'")
     # description
-    desc = meta.get("description", "")
+    desc = str(meta.get("description", "") or "")
     if not desc:
         errors.append("description is missing or empty")
     elif len(desc) > 1024:
         errors.append(f"description exceeds 1024 characters ({len(desc)})")
     # compatibility (optional, max 500)
-    compat = meta.get("compatibility", "")
+    compat = str(meta.get("compatibility", "") or "")
     if compat and len(compat) > 500:
         errors.append(f"compatibility exceeds 500 characters ({len(compat)})")
     return errors
@@ -159,7 +222,7 @@ def _load_agent_skills_from_dir(
             continue
         raw        = skill_md.read_text(encoding="utf-8")
         meta, body = _parse_frontmatter(raw)
-        name       = meta.get("name", skill_dir.name).lower()
+        name       = str(meta.get("name", skill_dir.name)).lower()
         errors     = _validate_skill(name, meta, skill_dir.name)
         for msg in errors:
             warnings.append(f"skill '{skill_dir.name}': {msg}")
@@ -167,9 +230,9 @@ def _load_agent_skills_from_dir(
             name = skill_dir.name  # fall back to folder name so it's still addressable
         skills[name] = AgentSkill(
             name          = name,
-            description   = meta.get("description", f"Agent skill: {name}"),
+            description   = str(meta.get("description", f"Agent skill: {name}")),
             path          = skill_md.resolve(),
-            compatibility = meta.get("compatibility", ""),
+            compatibility = str(meta.get("compatibility", "") or ""),
             body          = body,
         )
     return skills, warnings
@@ -202,4 +265,5 @@ def load_context(cwd: str) -> ProjectContext:
         all_warnings.extend(layer_warnings)
 
     return ProjectContext(instructions=instructions, skills=commands,
-                         agent_skills=agent_skills, skill_warnings=all_warnings)
+                         agent_skills=agent_skills, skill_warnings=all_warnings,
+                         fingerprint=context_fingerprint(cwd))

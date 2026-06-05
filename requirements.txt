@@ -3,3 +3,5 @@ rich>=13.7.0
 prompt_toolkit>=3.0.43
 python-dotenv>=1.0.0
 ddgs>=0.1.0
+PyYAML>=6.0
+certifi>=2023.0.0

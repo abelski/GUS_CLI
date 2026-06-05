@@ -1,12 +1,14 @@
 """MCP (Model Context Protocol) client — manages stdio-based MCP servers."""
 import json
 import os
+import queue
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
-from config import setup_logging
+from config import setup_logging, MCP_TIMEOUT
 
 log = setup_logging()
 
@@ -48,6 +50,7 @@ class _MCPServer:
         self._lock = threading.Lock()
         self._next_id = 1
         self.tools: list[dict] = []
+        self._stdout_q: "queue.Queue[str | None]" = queue.Queue()
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -66,6 +69,11 @@ class _MCPServer:
             bufsize=1,
         )
         log.info("mcp: started '%s' (pid=%d)", self.name, self._process.pid)
+
+        # Drain stdout/stderr on daemon threads so a chatty or hung server can
+        # never fill a pipe buffer (deadlock) or block a read forever.
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+        threading.Thread(target=self._pump_stderr, daemon=True).start()
 
         resp = self._send("initialize", {
             "protocolVersion": "2024-11-05",
@@ -115,6 +123,23 @@ class _MCPServer:
             return f"Error: {result}"
         return result
 
+    # ── pipe pumps ─────────────────────────────────────────────────────────
+
+    def _pump_stdout(self) -> None:
+        proc = self._process
+        if proc is None or proc.stdout is None:
+            return
+        for line in proc.stdout:           # blocks in this thread only
+            self._stdout_q.put(line)
+        self._stdout_q.put(None)           # EOF sentinel
+
+    def _pump_stderr(self) -> None:
+        proc = self._process
+        if proc is None or proc.stderr is None:
+            return
+        for line in proc.stderr:
+            log.debug("mcp[%s] stderr: %s", self.name, line.rstrip())
+
     # ── JSON-RPC transport ─────────────────────────────────────────────────
 
     def _send(self, method: str, params: dict) -> dict | None:
@@ -135,31 +160,41 @@ class _MCPServer:
             try:
                 proc.stdin.write(request + "\n")  # type: ignore[union-attr]
                 proc.stdin.flush()                # type: ignore[union-attr]
-
-                # Read lines until we match our response id; skip notifications
-                while True:
-                    line = proc.stdout.readline()  # type: ignore[union-attr]
-                    if not line:
-                        return None
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if "id" not in data:
-                        continue  # notification — ignore
-                    if data["id"] != msg_id:
-                        continue  # response to a different call
-                    if "error" in data:
-                        log.error("mcp: %s/%s error: %s", self.name, method, data["error"])
-                        return None
-                    return data.get("result") or {}
-
             except OSError as e:
                 log.error("mcp: %s/%s IO error: %s", self.name, method, e)
                 return None
+
+            # Read responses from the pump thread with an overall deadline so a
+            # hung or dead server can never block us forever.
+            deadline = time.monotonic() + MCP_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.error("mcp: %s/%s timed out after %.0fs", self.name, method, MCP_TIMEOUT)
+                    return None
+                try:
+                    line = self._stdout_q.get(timeout=remaining)
+                except queue.Empty:
+                    log.error("mcp: %s/%s timed out after %.0fs", self.name, method, MCP_TIMEOUT)
+                    return None
+                if line is None:
+                    log.error("mcp: '%s' stdout closed (process exited)", self.name)
+                    return None
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "id" not in data:
+                    continue  # notification — ignore
+                if data["id"] != msg_id:
+                    continue  # response to a different/earlier call — drop
+                if "error" in data:
+                    log.error("mcp: %s/%s error: %s", self.name, method, data["error"])
+                    return None
+                return data.get("result") or {}
 
     def _notify(self, method: str, params: dict) -> None:
         proc = self._process

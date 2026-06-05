@@ -44,6 +44,7 @@ class Routine:
     run_count: int         = 0
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    agent: "Agent | None"  = None  # isolated agent for this routine's history
 
     @property
     def is_every_turn(self) -> bool:
@@ -82,6 +83,14 @@ class RoutineManager:
         self._counter += 1
         return f"r{self._counter}"
 
+    def _fire(self, routine: Routine) -> None:
+        """Run one routine turn against its isolated agent (keep cwd/model in sync)."""
+        agent = routine.agent or self._agent
+        agent.cwd = self._agent.cwd
+        agent.model = self._agent.model
+        agent.run_turn(routine.prompt)
+        routine.run_count += 1
+
     def _thread_body(self, routine: Routine) -> None:
         """Background thread: sleep, acquire lock, run, repeat."""
         import ui
@@ -92,8 +101,7 @@ class RoutineManager:
                     f"({routine.label()}) …[/bold yellow]"
                 )
                 try:
-                    self._agent.run_turn(routine.prompt)
-                    routine.run_count += 1
+                    self._fire(routine)
                 except Exception as e:
                     ui.print_error(f"Routine [{routine.id}] error: {e}")
 
@@ -102,7 +110,8 @@ class RoutineManager:
     def add_timed(self, prompt: str, interval: float) -> Routine:
         """Start a background routine that fires every `interval` seconds."""
         rid     = self._next_id()
-        routine = Routine(id=rid, prompt=prompt, interval=interval)
+        routine = Routine(id=rid, prompt=prompt, interval=interval,
+                          agent=self._agent.fork())
         t = threading.Thread(target=self._thread_body, args=(routine,), daemon=True)
         routine.thread = t
         self.timed[rid] = routine
@@ -112,7 +121,8 @@ class RoutineManager:
     def add_every_turn(self, prompt: str) -> Routine:
         """Register a hook that runs before every user prompt."""
         rid     = self._next_id()
-        routine = Routine(id=rid, prompt=prompt, interval=0)
+        routine = Routine(id=rid, prompt=prompt, interval=0,
+                          agent=self._agent.fork())
         self.every_turn.append(routine)
         return routine
 
@@ -148,8 +158,7 @@ class RoutineManager:
                     f"\n[bold yellow]🔁 Every-turn hook [{routine.id}] …[/bold yellow]"
                 )
                 try:
-                    self._agent.run_turn(routine.prompt)
-                    routine.run_count += 1
+                    self._fire(routine)
                 except Exception as e:
                     ui.print_error(f"Hook [{routine.id}] error: {e}")
 

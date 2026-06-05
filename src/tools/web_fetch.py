@@ -16,6 +16,8 @@ def _ssl_context() -> ssl.SSLContext:
     try:
         return ssl.create_default_context()
     except Exception:
+        # Last resort: certificate verification could not be set up. This is
+        # insecure (MITM-able) — callers surface a warning when it's used.
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -82,6 +84,13 @@ SCHEMA = {
 
 def run(url: str, cwd: str, max_chars: int = _MAX_CHARS) -> str:
     max_chars = min(max_chars, 30_000)
+    ctx = _ssl_context()
+    insecure_note = ""
+    if ctx.verify_mode == ssl.CERT_NONE:
+        insecure_note = (
+            "[warning: TLS certificate verification is DISABLED on this system "
+            "(no CA bundle available) — this response is not authenticated]\n\n"
+        )
     try:
         req = urllib.request.Request(
             url,
@@ -90,7 +99,7 @@ def run(url: str, cwd: str, max_chars: int = _MAX_CHARS) -> str:
                 "Accept": "text/html,application/xhtml+xml,text/plain,*/*",
             },
         )
-        with urllib.request.urlopen(req, timeout=20, context=_ssl_context()) as resp:
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
             content_type = resp.headers.get("Content-Type", "")
             raw = resp.read(512_000)
     except urllib.error.HTTPError as e:
@@ -116,4 +125,4 @@ def run(url: str, cwd: str, max_chars: int = _MAX_CHARS) -> str:
     if len(text) > max_chars:
         text = text[:max_chars] + f"\n\n[truncated — {len(text) - max_chars} more chars not shown]"
 
-    return text or "(empty response)"
+    return insecure_note + (text or "(empty response)")

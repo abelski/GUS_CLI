@@ -248,4 +248,4 @@ GUS is sandboxed to its working directory — tools cannot read or write files o
 
 ## License
 
-MIT
+GNU General Public License v3.0 — see [LICENSE](LICENSE).

@@ -41,6 +41,22 @@ FREE_MODEL_FALLBACKS = [
 MAX_TOKENS = int(os.environ.get("AGENT_MAX_TOKENS", "2048"))
 WORKING_DIR = os.environ.get("AGENT_WORKING_DIR", str(Path.cwd()))
 
+# Safety / reliability limits
+# Max tool-use iterations inside a single agent turn before we stop and report.
+MAX_ITERATIONS = int(os.environ.get("AGENT_MAX_ITERATIONS", "50"))
+# Max times the autonomous goal loop will re-prompt before giving up.
+MAX_GOAL_ITERATIONS = int(os.environ.get("AGENT_MAX_GOAL_ITERATIONS", "25"))
+# Auto-compact history once the estimated context size crosses this many tokens.
+# 0 disables automatic compaction.
+COMPACT_THRESHOLD_TOKENS = int(os.environ.get("AGENT_COMPACT_THRESHOLD", "100000"))
+# Transient-error retry policy for model calls.
+MAX_RETRIES = int(os.environ.get("AGENT_MAX_RETRIES", "3"))
+RETRY_BASE_DELAY = float(os.environ.get("AGENT_RETRY_BASE_DELAY", "1.0"))
+# Cap on concurrent worker threads when a turn emits many tool calls.
+MAX_TOOL_WORKERS = int(os.environ.get("AGENT_MAX_TOOL_WORKERS", "8"))
+# MCP JSON-RPC response timeout (seconds).
+MCP_TIMEOUT = float(os.environ.get("AGENT_MCP_TIMEOUT", "60"))
+
 LOG_FILE = os.environ.get("AGENT_LOG_FILE", str(CONFIG_DIR / "gus.log"))
 
 

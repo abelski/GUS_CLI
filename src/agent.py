@@ -2,16 +2,34 @@
 import concurrent.futures
 import json
 import platform
-import sys
+import time
 
-from openai import OpenAI, RateLimitError
+from openai import (
+    OpenAI,
+    RateLimitError,
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+)
 
 import ui
-from config import MAX_TOKENS, FREE_MODEL_FALLBACKS, setup_logging
-from tools import TOOL_SCHEMAS, execute_tool
+from config import (
+    MAX_TOKENS,
+    FREE_MODEL_FALLBACKS,
+    MAX_ITERATIONS,
+    COMPACT_THRESHOLD_TOKENS,
+    MAX_RETRIES,
+    RETRY_BASE_DELAY,
+    MAX_TOOL_WORKERS,
+    setup_logging,
+)
+from tools import TOOL_SCHEMAS, execute_tool, spawn_agent
 from tools._exceptions import ToolInterrupted
 
 log = setup_logging()
+
+# Errors worth retrying with backoff (transient: network blips, 5xx, timeouts).
+_TRANSIENT_ERRORS = (APIConnectionError, APITimeoutError, InternalServerError)
 
 _BASE_SYSTEM_PROMPT = """\
 You are GUS, a powerful autonomous assistant running in a terminal.
@@ -169,6 +187,18 @@ class Agent:
         self.mode = mode
         self.system_prompt = _build_system_prompt(self._extra, mode, self._agent_skills)
 
+    def fork(self) -> "Agent":
+        """Create a sibling agent sharing config but with its own empty history.
+
+        Used for background routines so their turns never pollute (or get
+        polluted by) the interactive conversation history.
+        """
+        return Agent(
+            client=self.client, model=self.model, cwd=self.cwd,
+            extra_instructions=self._extra, mode=self.mode,
+            agent_skills=self._agent_skills,
+        )
+
     def clear(self) -> None:
         self.history = []
         self._last_response = ""
@@ -196,9 +226,8 @@ class Agent:
             }]
         )
 
-        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
         response = None
-        for model in models_to_try:
+        for model in self._models_to_try():
             try:
                 response = self.client.chat.completions.create(
                     model=model,
@@ -207,8 +236,8 @@ class Agent:
                     stream=False,
                 )
                 break
-            except RateLimitError:
-                log.warning("compact: rate-limited on %s, trying next", model)
+            except Exception as e:
+                log.warning("compact: error on %s (%s), trying next", model, e)
 
         if response is None:
             return "", 0
@@ -230,8 +259,7 @@ class Agent:
             + [{"role": "user",
                 "content": "[Side question — answer briefly, do not take any action]\n\n" + question}]
         )
-        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
-        for model in models_to_try:
+        for model in self._models_to_try():
             try:
                 resp = self.client.chat.completions.create(
                     model=model,
@@ -240,9 +268,9 @@ class Agent:
                     stream=False,
                 )
                 return resp.choices[0].message.content or ""
-            except RateLimitError:
-                log.warning("btw: rate-limited on %s, trying next", model)
-        return "Error: all models rate-limited."
+            except Exception as e:
+                log.warning("btw: error on %s (%s), trying next", model, e)
+        return "Error: all models failed."
 
     def recap(self) -> str:
         """Return a one-sentence summary of this session without modifying history."""
@@ -289,10 +317,20 @@ class Agent:
     def _exec_tool(self, tc: dict) -> tuple[dict, str, bool]:
         """Execute one tool call; returns (tc, result, was_interrupted)."""
         args = {}
-        try:
-            args = json.loads(tc["arguments"])
-        except json.JSONDecodeError:
-            pass
+        raw_args = tc.get("arguments") or ""
+        if raw_args.strip():
+            try:
+                args = json.loads(raw_args)
+            except json.JSONDecodeError as exc:
+                # Feed the parse failure back to the model so it can retry with
+                # well-formed arguments instead of silently calling with {}.
+                msg = (
+                    f"Error: could not parse arguments for tool '{tc['name']}' as JSON "
+                    f"({exc}). Re-issue the call with valid JSON arguments."
+                )
+                ui.print_tool_result(tc["name"], msg, error=True)
+                log.error("tool %s: bad JSON args: %s", tc["name"], raw_args[:200])
+                return tc, msg, False
         log.debug("tool call: %s  args=%s", tc["name"], json.dumps(args))
         # Skill activation — show a clean banner, suppress the raw read_file output
         _is_skill_load = (
@@ -323,16 +361,33 @@ class Agent:
 
     def run_turn(self, user_message: str) -> None:
         self.total_turns += 1
+        self._maybe_compact()
         self.history.append({"role": "user", "content": user_message})
 
-        while True:
+        for iteration in range(1, MAX_ITERATIONS + 1):
             response_text, tool_calls = self._stream_response()
 
             if not tool_calls:
                 if response_text:
                     self._last_response = response_text
+                    self.history.append({"role": "assistant", "content": response_text})
                 ui.print_gus_done()
-                break
+                return
+
+            if iteration == MAX_ITERATIONS:
+                # Stop runaway loops: record the cap and let the model wrap up
+                # on the next turn instead of looping forever.
+                self.history.append({
+                    "role": "assistant",
+                    "content": (
+                        f"[Stopped after {MAX_ITERATIONS} tool-use iterations to avoid "
+                        "a runaway loop. Summarise progress so far and ask how to proceed.]"
+                    ),
+                })
+                ui.print_warning(
+                    f"  Reached the {MAX_ITERATIONS}-iteration limit for this turn — stopping."
+                )
+                return
 
             self.history.append({
                 "role": "assistant",
@@ -353,7 +408,8 @@ class Agent:
             if len(tool_calls) == 1:
                 exec_results = [self._exec_tool(tool_calls[0])]
             else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+                workers = min(len(tool_calls), MAX_TOOL_WORKERS)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                     futures = [executor.submit(self._exec_tool, tc) for tc in tool_calls]
                     exec_results = [f.result() for f in futures]
 
@@ -370,17 +426,50 @@ class Agent:
             if interrupted:
                 return
 
-    def _stream_response(self) -> tuple[str, list[dict]]:
-        models_to_try = [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
-        last_error = None
-        for model in models_to_try:
-            try:
-                return self._call_model(model)
-            except RateLimitError as e:
-                last_error = e
-                log.warning("rate-limited on %s, trying next model", model)
+    def _maybe_compact(self) -> None:
+        """Auto-compact history when its estimated size crosses the threshold."""
+        if COMPACT_THRESHOLD_TOKENS <= 0 or len(self.history) < 4:
+            return
+        total = self.context_stats()["total"]
+        if total < COMPACT_THRESHOLD_TOKENS:
+            return
+        ui.print_info(
+            f"  Context ~{total:,} tokens ≥ {COMPACT_THRESHOLD_TOKENS:,} — auto-compacting…"
+        )
+        _, count = self.compact()
+        if count:
+            ui.print_info(f"  Compacted {count} messages into a summary.")
 
-        raise last_error
+    def _models_to_try(self) -> list[str]:
+        return [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
+
+    def _stream_response(self) -> tuple[str, list[dict]]:
+        """Stream a model response, falling back across models and retrying
+        transient errors (network/5xx/timeout) with exponential backoff."""
+        last_error: Exception | None = None
+        for model in self._models_to_try():
+            for attempt in range(MAX_RETRIES):
+                try:
+                    return self._call_model(model)
+                except RateLimitError as e:
+                    last_error = e
+                    log.warning("rate-limited on %s, trying next model", model)
+                    break  # don't retry same model on 429 — move to the next
+                except _TRANSIENT_ERRORS as e:
+                    last_error = e
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    log.warning("transient error on %s (attempt %d/%d): %s — retrying in %.1fs",
+                                model, attempt + 1, MAX_RETRIES, e, delay)
+                    if attempt + 1 < MAX_RETRIES:
+                        time.sleep(delay)
+                except Exception as e:
+                    # Non-transient (e.g. model-not-found 404, bad request) —
+                    # don't retry this model, try the next fallback instead.
+                    last_error = e
+                    log.warning("error on %s: %s — trying next model", model, e)
+                    break
+
+        raise last_error if last_error else RuntimeError("no model available")
 
     def _call_model(self, model: str) -> tuple[str, list[dict]]:
         messages = [{"role": "system", "content": self.system_prompt}] + self.history
@@ -449,8 +538,41 @@ class Agent:
                 ui.print_assistant_end()
 
         tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
-
-        if full_text and not tool_calls:
-            self.history.append({"role": "assistant", "content": full_text})
-
+        # NOTE: history append is owned by run_turn (single source of truth) so
+        # a mid-stream retry/fallback never leaves a half-written assistant turn.
         return full_text, tool_calls
+
+
+def _run_subagent(task: str, cwd: str, context: str = "") -> str:
+    """Spawn an isolated sub-agent for one task; return its final summary.
+
+    Registered with the spawn_agent tool at import time so that module never
+    has to import this one (keeps agent → tools acyclic).
+    """
+    from config import get_client, DEFAULT_MODEL
+
+    system_extra = (
+        "You are a sub-agent handling one specific task. "
+        "Complete it fully, then write a concise summary of every action you took "
+        "and every file you changed."
+    )
+    if context:
+        system_extra += f"\n\nContext from parent agent:\n{context}"
+
+    ui.print_subagent_start(task)
+    try:
+        sub = Agent(client=get_client(), model=DEFAULT_MODEL, cwd=cwd,
+                    extra_instructions=system_extra)
+        sub.run_turn(task)
+    except Exception as e:
+        ui.print_subagent_end(failed=True)
+        return f"Sub-agent failed: {e}"
+
+    ui.print_subagent_end(failed=False)
+    for msg in reversed(sub.history):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            return msg["content"]
+    return "Sub-agent completed the task (no text summary produced)."
+
+
+spawn_agent.register_runner(_run_subagent)

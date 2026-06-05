@@ -1,5 +1,13 @@
+import shutil
 import subprocess
 from ._sandbox import resolve, sandbox_check
+
+# Directories that are large, generated, or vendored — skipped by default so
+# searches stay fast and results stay signal-rich.
+_PRUNE_DIRS = (
+    ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
+    ".pytest_cache", ".ruff_cache", "dist", "build", ".next", ".tox", "target",
+)
 
 SCHEMA = {
     "type": "function",
@@ -42,9 +50,22 @@ def run(
     search_path = resolve(path, cwd) if path else cwd
     if err := sandbox_check(search_path, cwd):
         return err
-    flags = [] if case_sensitive else ["-i"]
-    include_flags = ["--include", include] if include else []
-    cmd = ["grep", "-rn", "--color=never"] + flags + include_flags + [pattern, search_path]
+
+    # Prefer ripgrep when available: faster and honours .gitignore automatically.
+    if shutil.which("rg"):
+        cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+        if not case_sensitive:
+            cmd.append("-i")
+        if include:
+            cmd += ["--glob", include]
+        for d in _PRUNE_DIRS:
+            cmd += ["--glob", f"!{d}/"]
+        cmd += [pattern, search_path]
+    else:
+        flags = [] if case_sensitive else ["-i"]
+        include_flags = ["--include", include] if include else []
+        prune_flags = [f"--exclude-dir={d}" for d in _PRUNE_DIRS]
+        cmd = ["grep", "-rn", "--color=never"] + flags + include_flags + prune_flags + [pattern, search_path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         out = result.stdout.strip()

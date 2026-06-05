@@ -20,9 +20,9 @@ from pathlib import Path
 from openai import AuthenticationError
 
 import ui
-from config import get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR
+from config import get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR, MAX_GOAL_ITERATIONS
 from agent import Agent
-from context import load_context, ProjectContext, Command
+from context import load_context, context_fingerprint, ProjectContext, Command
 from loop import RoutineManager, parse_interval, interval_label
 from mcp_client import MCPManager
 from tools import register_mcp_tools
@@ -280,11 +280,20 @@ def _check_goal_satisfied(agent: Agent) -> bool:
 
 def _run_goal_loop(agent: Agent, routines: RoutineManager) -> None:
     """After a turn completes, auto-continue if goal is not yet satisfied."""
+    iterations = 0
     while agent.goal:
-        ui.print_info(f"  Checking goal: {agent.goal!r}")
+        if iterations >= MAX_GOAL_ITERATIONS:
+            ui.print_warning(
+                f"  Goal loop hit the {MAX_GOAL_ITERATIONS}-iteration cap without being "
+                f"satisfied — pausing. Goal preserved; use /goal clear to cancel."
+            )
+            break
+        iterations += 1
+        ui.print_info(f"  Checking goal ({iterations}/{MAX_GOAL_ITERATIONS}): {agent.goal!r}")
         try:
             satisfied = _check_goal_satisfied(agent)
-        except Exception:
+        except Exception as e:
+            ui.print_error(f"Goal check failed: {e} — pausing goal loop.")
             break
         if satisfied:
             ui.print_goal_achieved(agent.goal)
@@ -303,6 +312,19 @@ def _run_goal_loop(agent: Agent, routines: RoutineManager) -> None:
 
 
 # ── Clipboard helper ───────────────────────────────────────────────────────
+
+def _confirm(question: str) -> bool:
+    """Ask a yes/no confirmation. Denies by default when non-interactive
+    (no TTY, or NO_QUESTIONS set) so destructive commands never block a
+    headless/routine run waiting on stdin."""
+    if os.environ.get("NO_QUESTIONS") == "1" or not sys.stdin.isatty():
+        ui.print_info(f"{question} [auto-declined — non-interactive]")
+        return False
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
 
 def _copy_to_clipboard(text: str) -> bool:
     """Copy text to system clipboard. Returns True on success."""
@@ -472,6 +494,7 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     if command == "/reload-skills":
         new_ctx = load_context(agent.cwd)
         ctx.instructions = new_ctx.instructions
+        ctx.fingerprint = new_ctx.fingerprint
         ctx.skills.clear()
         ctx.skills.update(new_ctx.skills)
         ctx.agent_skills.clear()
@@ -571,11 +594,9 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     name = command.lstrip("/")
     if name in ctx.skills:
         cmd = ctx.skills[name]
-        if cmd.confirm:
-            answer = input(f"  Run /{name}? [y/N] ").strip().lower()
-            if answer not in ("y", "yes"):
-                ui.print_info("Cancelled.")
-                return True
+        if cmd.confirm and not _confirm(f"  Run /{name}?"):
+            ui.print_info("Cancelled.")
+            return True
         if cmd.max_iterations > 1:
             _run_fixed_loop(cmd, rest, agent, cmd.max_iterations, ctx)
         else:
@@ -596,8 +617,16 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
 # ── Context sync ──────────────────────────────────────────────────────────
 
 def _sync_ctx(ctx: ProjectContext, agent: Agent) -> None:
-    """Reload skills/commands from disk into ctx. Called after each turn."""
+    """Reload skills/commands from disk into ctx. Called after each turn.
+
+    Skips the full disk scan + system-prompt rebuild when nothing on disk
+    changed (the common case), so steady-state turns pay only a cheap stat walk.
+    """
+    fp = context_fingerprint(agent.cwd)
+    if fp == ctx.fingerprint and agent._extra == ctx.instructions:
+        return
     new = load_context(agent.cwd)
+    ctx.fingerprint = new.fingerprint
     added_cmds   = [k for k in new.skills       if k not in ctx.skills]
     added_skills = [k for k in new.agent_skills if k not in ctx.agent_skills]
     ctx.skills.clear()
