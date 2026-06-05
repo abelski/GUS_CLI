@@ -43,7 +43,10 @@ Your main use case is repeatable, automated tasks that run on a schedule or in a
 - Never stop mid-task to ask a clarifying question unless the action is irreversible and the risk is high.
 - Chain tool calls freely: read → analyse → edit → verify → report in a single turn.
 - If a task fails, diagnose and retry with a different approach before reporting the error.
-- Prefer writing scripts or shell commands that can be re-run over one-off manual steps.
+- Just do the task the user asked for. Do NOT turn a one-off request into a reusable
+  artifact: never create a slash command (.gus/commands/) or a skill (.gus/skills/)
+  unless the user explicitly asks you to "create a command/skill". If asked to "open a
+  browser", open the browser — don't write a command that opens browsers.
 
 ## Tool use
 - Use tools for everything — do not describe what you would do, just do it.
@@ -68,8 +71,10 @@ This lets you expand your own capabilities mid-conversation without restarting.
 - If you need a temporary file, create it inside the working directory (e.g. `./tmp/`).
 
 ## Creating commands
-When the user asks to "create a command", "add a command", "make a slash command", or
-"create a command that/for/to …", they always mean a GUS slash command — a `.gus/commands/<name>.md` file.
+Only create a command when the user EXPLICITLY asks for one ("create a command", "add a
+command", "make a slash command", "create a command that/for/to …"). A bare task request
+("open a browser", "summarise the diff") is NOT such a request — just do the task. When the
+user does ask, they always mean a GUS slash command — a `.gus/commands/<name>.md` file.
 Never create a shell script or Python script as the output.
 
 Process — always follow ALL steps in order:
@@ -105,7 +110,9 @@ Read the file back. Confirm it was written correctly.
 Tell the user: "Created `/name` — type `/name [args]` to run it."
 
 ## Creating skills
-When the user asks to "create a skill", "add a skill", or "make a skill", they mean the agentskills.io format.
+Only create a skill when the user EXPLICITLY asks for one. Do not invent a skill to satisfy
+an ordinary task request. When the user asks to "create a skill", "add a skill", or "make a
+skill", they mean the agentskills.io format.
 Create `.gus/skills/<skill-name>/SKILL.md` with YAML frontmatter (`name`, `description`) and a step-by-step body.
 Never use any other format or location.
 
@@ -139,7 +146,8 @@ def _platform_note() -> str:
 
 
 def _build_system_prompt(extra_instructions: str = "", mode: str = "agent",
-                          agent_skills: dict | None = None) -> str:
+                          agent_skills: dict | None = None,
+                          findings_text: str = "") -> str:
     prompt = _BASE_SYSTEM_PROMPT + _platform_note()
     if extra_instructions:
         prompt += "\n\n# Project Instructions\n" + extra_instructions
@@ -153,6 +161,12 @@ def _build_system_prompt(extra_instructions: str = "", mode: str = "agent",
         for skill in agent_skills.values():
             lines.append(f"- **{skill.name}**: {skill.description}  \n  SKILL.md: `{skill.path}`")
         prompt += "\n\n" + "\n".join(lines)
+    if findings_text:
+        prompt += (
+            "\n\n## Past Findings (this project)\n"
+            "Lessons recorded from earlier sessions in this project — consult them "
+            "before repeating work or known mistakes.\n\n" + findings_text
+        )
     if mode == "plan":
         prompt += "\n\n" + _PLAN_MODE_ADDITION
     return prompt
@@ -161,14 +175,17 @@ def _build_system_prompt(extra_instructions: str = "", mode: str = "agent",
 class Agent:
     def __init__(self, client: OpenAI, model: str, cwd: str,
                  extra_instructions: str = "", mode: str = "agent",
-                 agent_skills: dict | None = None) -> None:
+                 agent_skills: dict | None = None,
+                 findings_text: str = "") -> None:
         self.client        = client
         self.model         = model
         self.cwd           = cwd
         self.mode          = mode
         self._extra        = extra_instructions
         self._agent_skills = agent_skills or {}
-        self.system_prompt = _build_system_prompt(extra_instructions, mode, self._agent_skills)
+        self._findings     = findings_text
+        self.system_prompt = _build_system_prompt(extra_instructions, mode,
+                                                  self._agent_skills, findings_text)
         self.history: list[dict] = []
 
         # session metadata
@@ -186,7 +203,8 @@ class Agent:
 
     def set_mode(self, mode: str) -> None:
         self.mode = mode
-        self.system_prompt = _build_system_prompt(self._extra, mode, self._agent_skills)
+        self.system_prompt = _build_system_prompt(self._extra, mode,
+                                                  self._agent_skills, self._findings)
 
     def fork(self) -> "Agent":
         """Create a sibling agent sharing config but with its own empty history.
@@ -197,7 +215,7 @@ class Agent:
         return Agent(
             client=self.client, model=self.model, cwd=self.cwd,
             extra_instructions=self._extra, mode=self.mode,
-            agent_skills=self._agent_skills,
+            agent_skills=self._agent_skills, findings_text=self._findings,
         )
 
     def clear(self) -> None:
@@ -281,6 +299,46 @@ class Agent:
             "Give exactly one sentence summarising what has been accomplished in this session. "
             "Be specific about files changed, tasks done, or conclusions reached."
         )
+
+    def extract_findings(self, transcript: str) -> str:
+        """Distil a completed turn into durable findings markdown.
+
+        Independent of self.history (builds its own message list) so it never
+        pollutes the conversation. Returns markdown under the three headings, or
+        the literal "NONE" when there is nothing worth recording.
+        """
+        system = (
+            "You distil a work log into durable lessons for future sessions. "
+            "Record only findings about the PROBLEM DOMAIN that would help complete a "
+            "similar task next time — facts about the project, environment, APIs, "
+            "commands, or errors and their fixes. "
+            "Do NOT record the agent's own routine mechanics as findings: writing/reading/"
+            "editing files, calling tools, or scaffolding a slash command or skill are "
+            "plumbing, not lessons — never log them as Successes. "
+            "A 'Success' means the user's actual task was achieved and you learned what "
+            "made it work; if the task was not actually completed, record nothing under "
+            "Successes. "
+            "Use up to three headings: **Successes** (what genuinely worked), "
+            "**Pitfalls** (gotchas to avoid), and **Problems & Solutions** (a problem hit "
+            "and how it was fixed). Use terse markdown bullets. Omit any heading with "
+            "nothing to say. If nothing is worth recording, reply with exactly: NONE"
+        )
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "Work log:\n\n" + transcript},
+        ]
+        for model in self._models_to_try():
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=512,
+                    stream=False,
+                )
+                return resp.choices[0].message.content or "NONE"
+            except Exception as e:
+                log.warning("extract_findings: error on %s (%s), trying next", model, e)
+        return "NONE"
 
     def context_stats(self) -> dict:
         """Estimate current context token usage broken down by message category."""
@@ -420,7 +478,14 @@ class Agent:
                 if response_text:
                     self._last_response = response_text
                     self.history.append({"role": "assistant", "content": response_text})
-                ui.print_gus_done()
+                    ui.print_gus_done()
+                else:
+                    # Model returned neither text nor a tool call — nothing
+                    # actually happened. Common when every free model is
+                    # rate-limited or returns an empty completion. Don't
+                    # celebrate an empty turn as success; say what happened so
+                    # the user can retry (and doesn't trust a false "done").
+                    ui.print_empty_response()
                 return
 
             if iteration == MAX_ITERATIONS:

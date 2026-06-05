@@ -2,6 +2,7 @@
 """GUS — CLI agent entry point."""
 import os
 import platform
+import signal
 import subprocess
 import sys
 
@@ -20,8 +21,14 @@ from pathlib import Path
 from openai import AuthenticationError
 
 import ui
-from config import get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR, MAX_GOAL_ITERATIONS
+from prompt_toolkit.shortcuts import radiolist_dialog
+
+from config import (
+    get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR, MAX_GOAL_ITERATIONS,
+    get_free_models, fetch_free_models, save_free_models, save_env_var,
+)
 from agent import Agent
+import findings
 from context import load_context, context_fingerprint, ProjectContext, Command
 from loop import RoutineManager, parse_interval, interval_label
 from mcp_client import MCPManager
@@ -70,7 +77,9 @@ _BUILTIN_COMMANDS: list[tuple[str, str]] = [
     ("/export",        "export conversation to clipboard or file"),
     ("/copy",          "copy last response to clipboard"),
     ("/cwd",           "show or change working directory"),
-    ("/model",         "show or switch model"),
+    ("/model",         "pick model from list (or /model <id>)"),
+    ("/settings",      "settings screen (model selection)"),
+    ("/findings",      "view, clear, or toggle the findings memory"),
     ("/usage",         "token usage and session stats"),
     ("/cost",          "token usage and session stats"),
     ("/stats",         "token usage and session stats"),
@@ -389,6 +398,123 @@ def _handle_mcp(mcp: "MCPManager | None") -> None:
         ui.console.print(f"  [cyan]{s['name']}[/cyan]  {status}  —  {tools}")
 
 
+# ── Settings ───────────────────────────────────────────────────────────────
+
+def _apply_model(agent: Agent, model: str, persist: bool = True) -> None:
+    """Switch the live agent model and (optionally) persist it to .env."""
+    agent.model = model
+    if persist:
+        save_env_var("AGENT_MODEL", model)
+
+
+def _numbered_model_select(models: list[tuple[str, str, str]],
+                           current: str) -> str | None:
+    """Fallback picker (numbered input) for terminals that can't run the
+    full-screen dialog. Returns the chosen model id, or None to cancel."""
+    ui.print_model_picker(models, current)
+    try:
+        choice = input("  Select model #: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not choice or choice in ("q", "quit", "cancel"):
+        return None
+    if not choice.isdigit() or not (1 <= int(choice) <= len(models)):
+        ui.print_error(f"Enter a number 1–{len(models)}.")
+        return None
+    return models[int(choice) - 1][0]
+
+
+def _interactive_model_select(models: list[tuple[str, str, str]],
+                              current: str) -> str | None:
+    """Arrow-key selectable dialog (↑/↓ · Enter · Esc). Pre-selects the
+    current model. Returns the chosen id, or None on cancel. Falls back to a
+    numbered picker if the full-screen dialog can't be drawn."""
+    values = [(mid, f"{label}    [{mid}]    {note}") for mid, label, note in models]
+    default = current if any(mid == current for mid, _, _ in models) else None
+    try:
+        return radiolist_dialog(
+            title="🦆 GUS — Select Model",
+            text="Free models from OpenRouter  ·  ↑/↓ move  ·  Enter select  ·  Esc cancel",
+            values=values,
+            default=default,
+        ).run()
+    except Exception:
+        return _numbered_model_select(models, current)
+
+
+def _pick_model(agent: Agent, refresh: bool = False) -> None:
+    """Open the interactive model picker, populated from the free-model list
+    cached in .env (re-fetched from OpenRouter when missing or refresh=True).
+    Persists the choice to .env (AGENT_MODEL) so it survives restarts. Shows
+    the list read-only when running non-interactively."""
+    if refresh:
+        with ui.loading_dance("Refreshing free models from OpenRouter"):
+            models = get_free_models(refresh=True)
+    else:
+        models = get_free_models()
+    if not models:
+        ui.print_error("No models available.")
+        return
+
+    # Non-interactive (no TTY / NO_QUESTIONS): just display the list.
+    if os.environ.get("NO_QUESTIONS") == "1" or not sys.stdin.isatty():
+        ui.print_model_picker(models, agent.model)
+        return
+
+    selected = _interactive_model_select(models, agent.model)
+    if selected is None or selected == agent.model:
+        ui.print_info("  Model unchanged.")
+        return
+    _apply_model(agent, selected)
+    ui.print_settings_saved(selected)
+
+
+def _handle_settings(rest: str, agent: Agent) -> None:
+    """`/settings` — settings screen. Currently: model selection.
+
+    `/settings refresh` re-fetches the free-model list from OpenRouter and
+    re-caches it to .env; bare `/settings` (or `/settings model`) uses the cache.
+    """
+    state = "on" if findings.findings_enabled() else "off"
+    ui.print_info(f"  Findings memory: {state}  [dim](toggle with /findings on|off)[/dim]")
+    refresh = rest.strip().lower() in ("refresh", "model refresh", "reload")
+    _pick_model(agent, refresh=refresh)
+
+
+def _refresh_findings_prompt(agent: Agent) -> None:
+    """Reload findings.md into the live system prompt after it changes on disk."""
+    agent._findings = findings.load(agent.cwd)
+    agent.set_mode(agent.mode)  # rebuild the system prompt with the new findings text
+
+
+def _handle_findings(rest: str, agent: Agent) -> None:
+    """`/findings [list|on|off|clear]` — manage the persistent findings memory."""
+    arg = rest.strip().lower()
+    if arg in ("on", "off"):
+        findings.set_enabled(arg == "on")
+        _refresh_findings_prompt(agent)
+        ui.print_info(f"  Findings memory turned {arg}.")
+        return
+    if arg == "clear":
+        path = findings.findings_path(agent.cwd)
+        if path.is_file():
+            path.unlink()
+        _refresh_findings_prompt(agent)
+        ui.print_info("  Findings memory cleared.")
+        return
+    if arg and arg != "list":
+        ui.print_error("Usage: /findings [list|on|off|clear]")
+        return
+    # Bare /findings or /findings list → show current state and contents.
+    state = "on" if findings.findings_enabled() else "off"
+    text = findings.load(agent.cwd)
+    ui.print_info(f"  Findings memory: {state}  [dim]({findings.findings_path(agent.cwd)})[/dim]")
+    if text:
+        ui.console.print(text)
+    else:
+        ui.print_info("  No findings recorded yet.")
+
+
 # ── Slash-command dispatcher ───────────────────────────────────────────────
 
 def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
@@ -479,13 +605,25 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
         ui.print_btw_result(rest, answer)
         return True
 
-    # ── model — switch or show model ─────────────────────────────────────────
+    # ── settings — interactive settings screen ───────────────────────────────
+    if command == "/settings":
+        _handle_settings(rest, agent)
+        return True
+
+    # ── findings — view / clear / toggle the persistent findings memory ──────
+    if command == "/findings":
+        _handle_findings(rest, agent)
+        return True
+
+    # ── model — open picker, or switch directly with an explicit id ──────────
     if command == "/model":
-        if not rest:
-            ui.print_info(f"  Current model: {agent.model}")
+        if not rest or rest.strip().lower() in ("refresh", "reload"):
+            # No argument → picker from .env cache; `refresh` → re-fetch list.
+            _pick_model(agent, refresh=bool(rest))
         else:
-            agent.model = rest.strip()
-            ui.print_info(f"  Model switched to: {agent.model}")
+            # Explicit id (e.g. /model anthropic/claude-opus-4-8) — switch and persist.
+            _apply_model(agent, rest.strip())
+            ui.print_info(f"  Model switched to: {agent.model} [dim](saved to .env)[/dim]")
         return True
 
     # ── recap — one-line session summary ────────────────────────────────────
@@ -654,6 +792,40 @@ def _sync_ctx(ctx: ProjectContext, agent: Agent) -> None:
         ui.print_warning(f"  Skill spec violation: {warn}")
 
 
+# ── Terminal resize handling ───────────────────────────────────────────────
+
+def _install_resize_handler():
+    """Install a SIGWINCH handler that repairs Rich Live output on resize.
+
+    Scoped to run only while GUS is rendering (an agent turn), so prompt_toolkit
+    keeps full ownership of SIGWINCH at the idle prompt. Returns the previous
+    handler to restore afterwards, or None when unavailable (Windows, or called
+    off the main thread — signal.signal raises there).
+    """
+    if not hasattr(signal, "SIGWINCH"):
+        return None
+
+    def _on_winch(signum, frame):
+        try:
+            ui.handle_resize()
+        except Exception:
+            pass
+
+    try:
+        return signal.signal(signal.SIGWINCH, _on_winch)
+    except (ValueError, OSError):
+        return None
+
+
+def _restore_resize_handler(prev) -> None:
+    if prev is None or not hasattr(signal, "SIGWINCH"):
+        return
+    try:
+        signal.signal(signal.SIGWINCH, prev)
+    except (ValueError, OSError):
+        pass
+
+
 # ── REPL ───────────────────────────────────────────────────────────────────
 
 def run_interactive(agent: Agent, ctx: ProjectContext,
@@ -707,32 +879,42 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
         if not user_input:
             continue
 
-        if user_input.startswith("/"):
-            try:
-                if not handle_slash_command(user_input, agent, ctx, routines, mcp=mcp):
-                    ui.print_error(
-                        f"Unknown command: {user_input.split()[0]}. Type /help."
-                    )
-            except _QuitSignal:
-                break  # fall through to cleanup
-            continue
-
-        ui.print_user(user_input)
+        # Take over SIGWINCH while we render so a window resize mid-output
+        # repairs the Rich Live region instead of corrupting it. Restored in
+        # the finally so prompt_toolkit owns resizes again at the idle prompt.
+        prev_winch = _install_resize_handler()
         try:
-            with routines.acquire():
-                agent.run_turn(user_input)
-            if agent.goal and not is_interrupted():
-                _run_goal_loop(agent, routines)
-        except KeyboardInterrupt:
-            ui.console.print("\n[dim]*interrupted — back to prompt (Ctrl+D or /exit to quit)*[/dim]")
-        except AuthenticationError:
-            if not _prompt_replace_key(agent):
-                break  # user chose to exit
-            ui.console.print("[dim]  Key updated — please re-send your message.[/dim]")
-        except Exception as e:
-            ui.print_confused(str(e))
-        else:
-            _sync_ctx(ctx, agent)
+            if user_input.startswith("/"):
+                try:
+                    if not handle_slash_command(user_input, agent, ctx, routines, mcp=mcp):
+                        ui.print_error(
+                            f"Unknown command: {user_input.split()[0]}. Type /help."
+                        )
+                except _QuitSignal:
+                    break  # fall through to cleanup
+                continue
+
+            ui.print_user(user_input)
+            try:
+                start = len(agent.history)
+                with routines.acquire():
+                    agent.run_turn(user_input)
+                if agent.goal and not is_interrupted():
+                    _run_goal_loop(agent, routines)
+                # Persist what was learned this turn (best-effort, never raises).
+                findings.persist_turn(agent, agent.history[start:], user_input)
+            except KeyboardInterrupt:
+                ui.console.print("\n[dim]*interrupted — back to prompt (Ctrl+D or /exit to quit)*[/dim]")
+            except AuthenticationError:
+                if not _prompt_replace_key(agent):
+                    break  # user chose to exit
+                ui.console.print("[dim]  Key updated — please re-send your message.[/dim]")
+            except Exception as e:
+                ui.print_confused(str(e))
+            else:
+                _sync_ctx(ctx, agent)
+        finally:
+            _restore_resize_handler(prev_winch)
 
     # ── clean exit ─────────────────────────────────────────────────────────
     routines.stop_all()
@@ -742,6 +924,8 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
 # ── One-shot ───────────────────────────────────────────────────────────────
 
 def run_oneshot(agent: Agent, prompt: str) -> None:
+    _install_resize_handler()  # no prompt_toolkit here, so keep it for the run
+    start = len(agent.history)
     try:
         agent.run_turn(prompt)
     except AuthenticationError:
@@ -757,28 +941,15 @@ def run_oneshot(agent: Agent, prompt: str) -> None:
     except Exception as e:
         ui.print_confused(str(e))
         sys.exit(1)
+    # Persist what was learned this run (best-effort, never raises).
+    findings.persist_turn(agent, agent.history[start:], prompt)
 
 
 # ── Key management ────────────────────────────────────────────────────────
 
 def _save_key_to_env(key: str) -> None:
     """Write/replace OPENROUTER_API_KEY in .env and update the live process env."""
-    lines: list[str] = []
-    if os.path.isfile(_ENV_FILE):
-        with open(_ENV_FILE, encoding="utf-8") as f:
-            lines = f.readlines()
-    # Replace existing line or append
-    replaced = False
-    for i, line in enumerate(lines):
-        if line.strip().startswith("OPENROUTER_API_KEY="):
-            lines[i] = f"OPENROUTER_API_KEY={key}\n"
-            replaced = True
-            break
-    if not replaced:
-        lines.append(f"OPENROUTER_API_KEY={key}\n")
-    with open(_ENV_FILE, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.environ["OPENROUTER_API_KEY"] = key
+    save_env_var("OPENROUTER_API_KEY", key)
 
 
 def _prompt_replace_key(agent: Agent | None = None) -> bool:
@@ -881,6 +1052,16 @@ def _ensure_env() -> None:
 
     ui.console.print("[bold green]  ✓ Key saved to .env — you're all set![/bold green]\n")
 
+    # Pre-fill the free-model list into .env so the picker is ready offline.
+    with ui.loading_dance("Fetching free models from OpenRouter"):
+        models = fetch_free_models()
+    if models:
+        save_free_models(models)
+        ui.console.print(
+            f"[bold green]  ✓ Loaded {len(models)} free models into .env "
+            "— pick one any time with /settings.[/bold green]\n"
+        )
+
 
 # ── Entry point ────────────────────────────────────────────────────────────
 
@@ -897,12 +1078,16 @@ def main() -> None:
     cwd   = os.path.abspath(os.path.expanduser(args.cwd))
     _ensure_gus_dirs(cwd)
     ctx   = load_context(cwd)
+    findings_text = findings.load(cwd)
     agent = Agent(client=client, model=DEFAULT_MODEL, cwd=cwd,
                   extra_instructions=ctx.instructions,
-                  agent_skills=ctx.agent_skills)
+                  agent_skills=ctx.agent_skills,
+                  findings_text=findings_text)
 
     if ctx.instructions:
         ui.print_info(f"  Loaded agents.md ({len(ctx.instructions)} chars)")
+    if findings_text:
+        ui.print_info(f"  Loaded findings memory ({len(findings_text)} chars)")
     if ctx.skills:
         ui.print_info(f"  Loaded {len(ctx.skills)} command(s): "
                       + ", ".join("/" + s for s in ctx.skills))
