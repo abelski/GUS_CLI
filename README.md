@@ -12,13 +12,13 @@ GUS chains tools end-to-end to complete tasks autonomously: reads files, edits c
 
 ### Download a pre-built binary (recommended)
 
-No Python required. Download the binary for your platform from the [latest GitHub release](https://github.com/abelski/Agent/releases/latest):
+No Python required. Download the binary for your platform from the [latest GitHub release](https://github.com/abelski/GUS_CLI/releases/latest):
 
-| Platform | File |
+| Platform | Download |
 |---|---|
-| macOS (Apple Silicon / Intel) | `gus-macos` |
-| Linux (x86-64) | `gus-linux` |
-| Windows | `gus-windows.exe` |
+| macOS (Apple Silicon / Intel) | [`gus-macos`](https://github.com/abelski/GUS_CLI/releases/latest/download/gus-macos) |
+| Linux (x86-64) | [`gus-linux`](https://github.com/abelski/GUS_CLI/releases/latest/download/gus-linux) |
+| Windows | [`gus-windows.exe`](https://github.com/abelski/GUS_CLI/releases/latest/download/gus-windows.exe) |
 
 **macOS / Linux — make it executable and run:**
 
@@ -59,8 +59,8 @@ gus
 **Requirements:** Python 3.10+
 
 ```bash
-git clone https://github.com/abelski/Agent.git
-cd Agent
+git clone https://github.com/abelski/GUS_CLI.git
+cd GUS_CLI
 pip install -r requirements.txt
 python src/main.py
 ```
