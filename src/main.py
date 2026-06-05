@@ -12,6 +12,7 @@ import argparse
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.styles import Style
 
 from pathlib import Path
@@ -53,6 +54,66 @@ class _QuitSignal(Exception):
 HISTORY_FILE = os.path.expanduser("~/.gus_history")
 PROMPT_STYLE = Style.from_dict({"prompt": "bold ansicyan"})
 
+_BUILTIN_COMMANDS: list[tuple[str, str]] = [
+    ("/help",          "show all commands"),
+    ("/clear",         "clear conversation history"),
+    ("/new",           "clear conversation history"),
+    ("/reset",         "clear conversation history"),
+    ("/compact",       "summarise history into one message"),
+    ("/plan",          "plan mode: analyse only, no writes"),
+    ("/go",            "execute the current plan"),
+    ("/agent",         "switch back to agent mode"),
+    ("/btw",           "ask a side question (no history change)"),
+    ("/recap",         "one-sentence session summary"),
+    ("/rename",        "name this session"),
+    ("/export",        "export conversation to clipboard or file"),
+    ("/copy",          "copy last response to clipboard"),
+    ("/cwd",           "show or change working directory"),
+    ("/model",         "show or switch model"),
+    ("/usage",         "token usage and session stats"),
+    ("/cost",          "token usage and session stats"),
+    ("/stats",         "token usage and session stats"),
+    ("/context",       "context window breakdown by category"),
+    ("/goal",          "set autonomous goal; GUS loops until met"),
+    ("/loop",          "repeat or schedule a routine"),
+    ("/skills",        "list all loaded skills"),
+    ("/reload-skills", "rescan .gus/commands/ and .gus/skills/ from disk"),
+    ("/mcp",           "list MCP servers and tools"),
+    ("/exit",          "quit"),
+    ("/quit",          "quit"),
+]
+
+
+class _GusCompleter(Completer):
+    """Complete slash commands; reads ctx live so new commands are picked up."""
+
+    def __init__(self, ctx: "ProjectContext") -> None:
+        self._ctx = ctx
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        word = text.lower()
+        seen: set[str] = set()
+        for cmd, desc in _BUILTIN_COMMANDS:
+            if cmd.startswith(word) and cmd not in seen:
+                seen.add(cmd)
+                yield Completion(cmd, start_position=-len(word),
+                                 display=cmd, display_meta=desc)
+        for name, skill in self._ctx.skills.items():
+            cmd = "/" + name
+            if cmd.startswith(word) and cmd not in seen:
+                seen.add(cmd)
+                yield Completion(cmd, start_position=-len(word),
+                                 display=cmd, display_meta=skill.description)
+        for name, skill in self._ctx.agent_skills.items():
+            cmd = "/" + name
+            if cmd.startswith(word) and cmd not in seen:
+                seen.add(cmd)
+                yield Completion(cmd, start_position=-len(word),
+                                 display=cmd, display_meta=skill.description)
+
 
 # ── Argument parsing ───────────────────────────────────────────────────────
 
@@ -76,7 +137,6 @@ def _run_command(cmd: Command, args: str, agent: Agent) -> None:
         if shell_output:
             ui.print_info(shell_output[:500] + ("…" if len(shell_output) > 500 else ""))
     prompt = cmd.build_prompt(args=args, shell_output=shell_output)
-    ui.print_user(prompt)
     agent.run_turn(prompt)
 
 
@@ -563,6 +623,8 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
     session: PromptSession = PromptSession(
         history=FileHistory(HISTORY_FILE),
         auto_suggest=AutoSuggestFromHistory(),
+        completer=_GusCompleter(ctx),
+        complete_while_typing=True,
         style=PROMPT_STYLE,
     )
     ui.print_hello_splash()

@@ -29,22 +29,32 @@ Never use any other format or location when creating skills.
 
 ## Creating commands
 
-When the user asks to "create a command" (or "add a command", "make a slash command"), they mean a `.gus/commands/<name>.md` file.
+When the user asks to "create a command", "add a command", "make a slash command", or "create a command that/for/to …", they **always** mean a GUS slash command — a `.gus/commands/<name>.md` file. Never create a shell script or Python script as the output.
 
-**Process — always follow this:**
-1. **Brainstorm interactively**: ask the user what the command should do, what arguments it takes, whether it needs a shell pre-step, and whether it should ask for confirmation before running.
-2. **Draft the frontmatter and prompt body** together with the user before writing.
-3. **Write the file** to `.gus/commands/<name>.md` (relative to `cwd`) using `write_file` only once the user confirms the draft. After writing, read the file back to confirm it exists and looks correct.
+**Process — always follow ALL steps in order:**
 
-Command file format:
+**Step 1 — Plan (think before writing)**
+Before touching any file, reason through the command design out loud in your response:
+- What is the exact purpose? What should it reliably accomplish?
+- Best command name (kebab-case, short, memorable)?
+- Does it need a `shell:` pre-step to gather live context? If yes — what exact shell command?
+- What arguments (`$ARGUMENTS`) should the user be able to pass?
+- Write a detailed, specific prompt body — precise enough to produce consistent results every time.
+  Include: goal, step-by-step agent instructions, output format, success criteria.
+- Should it require `confirm: true` (for destructive or irreversible actions)?
+
+**Step 2 — Write**
+Write `.gus/commands/<name>.md` using `write_file`.
+
 ```markdown
 ---
 description: One-line description shown in /help
 shell: <optional shell command; output available as $SHELL_OUTPUT>
-confirm: true   # optional — prompt user before executing
-max_iterations: 5  # optional — cap for /loop usage
+confirm: true   # optional
+max_iterations: 5  # optional
 ---
-Prompt body. Use $ARGUMENTS for text after the command name.
+Prompt body. Use $ARGUMENTS for user input. Use $SHELL_OUTPUT if a shell pre-step is defined.
 ```
 
-The file stem (filename without `.md`) becomes the slash command name.
+**Step 3 — Verify**
+Read the file back. Tell the user: "Created `/name` — type `/name [args]` to run it."
