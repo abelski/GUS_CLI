@@ -1,6 +1,8 @@
 import subprocess
+import time
 
 from ._exceptions import ToolInterrupted
+from ._interrupt import is_interrupted
 from ._sandbox import bash_sandbox_check
 
 SCHEMA = {
@@ -43,7 +45,23 @@ def run(command: str, cwd: str, timeout: int = 30) -> str:
             text=True,
             cwd=cwd,
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
+        # Poll in short slices so a Ctrl+C from another thread (parallel tool
+        # calls / sub-agents set the shared interrupt flag) can kill the child
+        # promptly, rather than blocking the whole timeout window.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                if is_interrupted():
+                    proc.kill()
+                    proc.communicate()
+                    raise ToolInterrupted("bash command interrupted by user.")
+                if time.monotonic() >= deadline:
+                    proc.kill()
+                    proc.communicate()
+                    return f"Error: command timed out after {timeout}s"
         output = ""
         if stdout:
             output += stdout
@@ -52,15 +70,12 @@ def run(command: str, cwd: str, timeout: int = 30) -> str:
         if proc.returncode != 0:
             output += f"\n[exit code: {proc.returncode}]"
         return output.strip() or "(no output)"
-    except subprocess.TimeoutExpired:
-        if proc:
-            proc.kill()
-            proc.communicate()
-        return f"Error: command timed out after {timeout}s"
     except KeyboardInterrupt:
         if proc:
             proc.kill()
             proc.communicate()
         raise ToolInterrupted("bash command interrupted by user.")
+    except ToolInterrupted:
+        raise  # propagate the cooperative-interrupt signal, don't swallow it
     except Exception as e:
         return f"Error running command: {e}"

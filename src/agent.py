@@ -25,6 +25,7 @@ from config import (
 )
 from tools import TOOL_SCHEMAS, execute_tool, spawn_agent
 from tools._exceptions import ToolInterrupted
+from tools._interrupt import clear_interrupt, is_interrupted, set_interrupt
 
 log = setup_logging()
 
@@ -359,12 +360,60 @@ class Agent:
             log.debug("tool result: %s  → %s", tc["name"], result[:200])
         return tc, result, False
 
+    def _run_tools(self, tool_calls: list[dict]) -> tuple[list[tuple[dict, str, bool]], bool]:
+        """Execute all tool calls, returning (results, interrupted).
+
+        Guarantees one (tc, result, was_interrupted) entry per call even when the
+        user hits Ctrl+C mid-flight, so the history never ends up with a
+        tool_call that has no matching tool response (which would break the next
+        API request). On interrupt, any unfinished call is recorded as
+        interrupted and the shared flag is set so worker-thread tools bail out.
+        """
+        msg = "Interrupted by user (Ctrl+C)."
+
+        if len(tool_calls) == 1:
+            try:
+                return [self._exec_tool(tool_calls[0])], False
+            except KeyboardInterrupt:
+                set_interrupt()
+                return [(tool_calls[0], msg, True)], True
+
+        workers = min(len(tool_calls), MAX_TOOL_WORKERS)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        futures = {executor.submit(self._exec_tool, tc): tc for tc in tool_calls}
+        done: dict[str, tuple[dict, str, bool]] = {}
+        interrupted = False
+        try:
+            for fut in concurrent.futures.as_completed(futures):
+                tc, result, was_int = fut.result()
+                done[tc["id"]] = (tc, result, was_int)
+                if was_int:
+                    interrupted = True
+        except KeyboardInterrupt:
+            set_interrupt()  # let still-running worker tools abort themselves
+            interrupted = True
+            for fut in futures:
+                fut.cancel()
+        finally:
+            executor.shutdown(wait=False)
+
+        results = []
+        for tc in tool_calls:
+            results.append(done.get(tc["id"], (tc, msg, True)))
+        return results, interrupted
+
     def run_turn(self, user_message: str) -> None:
         self.total_turns += 1
+        clear_interrupt()
         self._maybe_compact()
         self.history.append({"role": "user", "content": user_message})
 
         for iteration in range(1, MAX_ITERATIONS + 1):
+            # Bail between iterations if the flag was tripped from another thread
+            # (e.g. the REPL stopping a background routine mid-run). History is
+            # consistent here — no half-written tool_calls to leave dangling.
+            if is_interrupted():
+                return
             response_text, tool_calls = self._stream_response()
 
             if not tool_calls:
@@ -405,25 +454,20 @@ class Agent:
                 ],
             })
 
-            if len(tool_calls) == 1:
-                exec_results = [self._exec_tool(tool_calls[0])]
-            else:
-                workers = min(len(tool_calls), MAX_TOOL_WORKERS)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [executor.submit(self._exec_tool, tc) for tc in tool_calls]
-                    exec_results = [f.result() for f in futures]
+            exec_results, interrupted = self._run_tools(tool_calls)
 
-            interrupted = False
-            for tc, result, was_interrupted in exec_results:
+            for tc, result, _ in exec_results:
                 self.history.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": result,
                 })
-                if was_interrupted:
-                    interrupted = True
 
             if interrupted:
+                ui.console.print(
+                    "\n[dim]*Interrupted — returning to prompt. History preserved; "
+                    "type a new instruction or /exit.*[/dim]"
+                )
                 return
 
     def _maybe_compact(self) -> None:

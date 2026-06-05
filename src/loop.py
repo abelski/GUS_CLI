@@ -94,6 +94,7 @@ class RoutineManager:
     def _thread_body(self, routine: Routine) -> None:
         """Background thread: sleep, acquire lock, run, repeat."""
         import ui
+        from tools._exceptions import ToolInterrupted
         while not routine.stop_event.wait(routine.interval):
             with self._lock:
                 ui.console.print(
@@ -102,6 +103,9 @@ class RoutineManager:
                 )
                 try:
                     self._fire(routine)
+                except ToolInterrupted:
+                    # User stopped this routine mid-run (Ctrl+C) — not an error.
+                    return
                 except Exception as e:
                     ui.print_error(f"Routine [{routine.id}] error: {e}")
 

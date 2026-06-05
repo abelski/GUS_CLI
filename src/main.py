@@ -26,6 +26,7 @@ from context import load_context, context_fingerprint, ProjectContext, Command
 from loop import RoutineManager, parse_interval, interval_label
 from mcp_client import MCPManager
 from tools import register_mcp_tools
+from tools._interrupt import is_interrupted, set_interrupt
 
 _ENV_FILE = str(CONFIG_DIR / ".env")
 
@@ -157,6 +158,12 @@ def _run_fixed_loop(prompt_or_cmd, args: str, agent: Agent,
                 agent.run_turn(text)
         except KeyboardInterrupt:
             ui.print_flying_away()
+            return
+        # A Ctrl+C during a tool returns from run_turn cleanly (history kept)
+        # rather than raising — break the whole loop instead of rolling into
+        # the next iteration.
+        if is_interrupted():
+            ui.console.print("\n[dim]*Loop interrupted by user — stopping.*[/dim]")
             return
     ui.console.print("[bold yellow]━━━ 🦆 Loop done ━━━[/bold yellow]")
 
@@ -308,6 +315,9 @@ def _run_goal_loop(agent: Agent, routines: RoutineManager) -> None:
             break
         except Exception as e:
             ui.print_confused(str(e))
+            break
+        if is_interrupted():
+            ui.console.print("\n[dim]*Goal loop interrupted — goal preserved. Use /goal clear to cancel.*[/dim]")
             break
 
 
@@ -671,15 +681,27 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
                 [("class:prompt", prompt_str)],
                 bottom_toolbar=toolbar,
             ).strip()
-        except (KeyboardInterrupt, EOFError):
-            try:
-                confirm = session.prompt(
-                    [("class:prompt", "\nExit GUS? [y/N] ")]
-                ).strip().lower()
-            except (KeyboardInterrupt, EOFError):
-                confirm = "y"
-            if confirm in ("y", "yes"):
-                break
+        except EOFError:
+            break  # Ctrl+D quits
+        except KeyboardInterrupt:
+            # Ctrl+C never quits GUS (use Ctrl+D or /exit). At the idle prompt
+            # the main thread can't see background routines running in daemon
+            # threads, so a Ctrl+C here is the user trying to stop them: signal
+            # the shared interrupt flag (any in-flight tool polls it and bails)
+            # and tear the routines down. With nothing running, just cancel the
+            # current input line like a shell.
+            active = routines.list_all()
+            if active:
+                set_interrupt()
+                routines.stop_all()
+                ui.console.print(
+                    f"\n[dim]*Stopped {len(active)} routine(s). "
+                    "Ctrl+D or /exit to quit GUS.*[/dim]"
+                )
+            else:
+                ui.console.print(
+                    "[dim]  (Ctrl+C cancels input — Ctrl+D or /exit to quit)[/dim]"
+                )
             continue
 
         if not user_input:
@@ -699,10 +721,10 @@ def run_interactive(agent: Agent, ctx: ProjectContext,
         try:
             with routines.acquire():
                 agent.run_turn(user_input)
-            if agent.goal:
+            if agent.goal and not is_interrupted():
                 _run_goal_loop(agent, routines)
         except KeyboardInterrupt:
-            ui.console.print("\n[dim]*interrupted — /exit to quit*[/dim]")
+            ui.console.print("\n[dim]*interrupted — back to prompt (Ctrl+D or /exit to quit)*[/dim]")
         except AuthenticationError:
             if not _prompt_replace_key(agent):
                 break  # user chose to exit

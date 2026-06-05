@@ -826,7 +826,8 @@ def print_help(skills: dict | None = None, agent_skills: dict | None = None) -> 
             "  [dim]e.g. /loop 1h summarise new commits[/dim]"
             f"{cmd_lines}\n\n"
             "[bold]Keyboard[/bold]\n"
-            "  Ctrl+C                 — interrupt current run / exit",
+            "  Ctrl+C                 — stop the current run / background routines\n"
+            "  Ctrl+D                 — quit GUS (or /exit)",
             title="[bold yellow]🦆 GUS — Help[/bold yellow]",
             box=box.SIMPLE,
             border_style="yellow",
