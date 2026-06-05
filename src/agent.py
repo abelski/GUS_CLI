@@ -33,6 +33,14 @@ Your main use case is repeatable, automated tasks that run on a schedule or in a
 - After making changes, verify them (re-read the file, run tests, check output) before reporting done.
 - When a task involves multiple files or steps, spawn_agent sub-agents to handle independent workstreams.
 
+## Agent Skills — on-demand discovery
+Skills listed under "Available Agent Skills" are those known at startup.
+New skills may be added during a session (e.g. after skill-creation runs).
+At any point you can scan for available skills by calling list_dir on `.gus/skills/`
+and `~/.gus/skills/`, then read_file any SKILL.md you find there.
+After loading a SKILL.md, follow its instructions as if the skill had been listed at startup.
+This lets you expand your own capabilities mid-conversation without restarting.
+
 ## Sandbox — strict file-creation rule
 - You are strictly sandboxed to the working directory. NEVER create, write, or move files to any path outside it.
 - ALL new files and directories must be created inside the working directory or its subdirectories.
@@ -77,8 +85,9 @@ def _build_system_prompt(extra_instructions: str = "", mode: str = "agent",
     if agent_skills:
         lines = [
             "## Available Agent Skills",
-            "The following skills are available. When a task matches a skill, "
-            "read the full SKILL.md at the listed path with read_file and follow its instructions.\n",
+            "The following skills are available. "
+            "Before starting any task, identify ALL skills relevant to it and read each one with read_file. "
+            "A task may require multiple skills — load all of them, then combine their instructions.\n",
         ]
         for skill in agent_skills.values():
             lines.append(f"- **{skill.name}**: {skill.description}  \n  SKILL.md: `{skill.path}`")
@@ -243,7 +252,17 @@ class Agent:
         except json.JSONDecodeError:
             pass
         log.debug("tool call: %s  args=%s", tc["name"], json.dumps(args))
-        ui.print_tool_call(tc["name"], args)
+        # Skill activation — show a clean banner, suppress the raw read_file output
+        _is_skill_load = (
+            tc["name"] == "read_file"
+            and args.get("path", "").endswith("SKILL.md")
+        )
+        if _is_skill_load:
+            import os as _os
+            skill_name = _os.path.basename(_os.path.dirname(args["path"]))
+            ui.print_skill_load(skill_name)
+        else:
+            ui.print_tool_call(tc["name"], args)
         try:
             result = execute_tool(tc["name"], args, self.cwd)
         except ToolInterrupted as exc:
@@ -252,7 +271,8 @@ class Agent:
             log.debug("tool interrupted: %s", tc["name"])
             return tc, msg, True
         is_error = result.startswith("Error:")
-        ui.print_tool_result(tc["name"], result, error=is_error)
+        if not _is_skill_load:
+            ui.print_tool_result(tc["name"], result, error=is_error)
         if is_error:
             log.error("tool %s failed: %s", tc["name"], result)
         else:

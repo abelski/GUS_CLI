@@ -2,6 +2,8 @@
 
 **G**eneral-purpose **U**tility **S**hell — a terminal AI CLI agent powered by [OpenRouter](https://openrouter.ai) models.
 
+GUS supports the [agentskills.io](https://agentskills.io/specification) open standard for agent skills — drop any compatible skill folder into `.gus/skills/` and it works immediately.
+
 GUS chains tools end-to-end to complete tasks autonomously: reads files, edits code, runs shell commands, searches the web — without stopping to ask questions mid-task. Built for repeatable, scheduled, or looped workflows where no human is present.
 
 ---
@@ -124,6 +126,47 @@ In the prompt body:
 
 ---
 
+## Agent Skills
+
+GUS supports the [agentskills.io](https://agentskills.io) open standard — skills are folders with a `SKILL.md` that teach GUS new capabilities.
+
+**Skill locations (auto-created on startup):**
+- `.gus/skills/<name>/SKILL.md` — project-level skills (checked into the repo)
+- `~/.gus/skills/<name>/SKILL.md` — user-level skills (available in every project)
+
+**Creating a skill with GUS itself:**
+
+Have a conversation, then ask GUS to save it:
+
+```
+> here's how I deploy to staging: ssh to host, run ./deploy.sh, tail the logs
+> create a skill from this conversation
+```
+
+GUS activates its built-in `skill-creation` skill and writes `.gus/skills/<name>/SKILL.md` for you. Once written, it announces the new skill immediately (`New skill(s) available: /deploy-staging`) with no restart needed.
+
+**Installing skills from https://github.com/anthropics/skills:**
+
+```bash
+cp -r path/to/anthropics-skills/skills/<skill-name> .gus/skills/
+```
+
+Then `/reload-skills` or restart GUS.
+
+**SKILL.md format:**
+
+```markdown
+---
+name: skill-name
+description: What it does and when to use it. Use when the user asks to ...
+---
+Step-by-step instructions the agent follows when this skill activates.
+```
+
+Full spec: [agentskills.io/specification](https://agentskills.io/specification)
+
+---
+
 ## Project instructions
 
 Create `agents.md` in the project root. GUS reads it at startup and injects it into every system prompt — use it to set coding style, project conventions, or domain context.
@@ -173,7 +216,8 @@ Agent/
 │       ├── spawn_agent.py
 │       └── ...
 ├── .gus/
-│   └── commands/        # Custom slash commands (*.md)
+│   ├── commands/        # Custom slash commands (*.md)
+│   └── skills/          # Agent Skills (agentskills.io format)
 ├── agents.md            # Project-level instructions for GUS
 ├── requirements.txt
 └── run.command          # macOS click-to-run
@@ -188,6 +232,8 @@ Agent/
 | `.env` | `OPENROUTER_API_KEY=sk-or-v1-...` |
 | `agents.md` | Project instructions injected into every prompt |
 | `.gus/commands/*.md` | Custom slash commands |
+| `.gus/skills/<name>/SKILL.md` | Agent Skills (project-level) |
+| `~/.gus/skills/<name>/SKILL.md` | Agent Skills (user-level, global) |
 
 GUS is sandboxed to its working directory — tools cannot read or write files outside it.
 

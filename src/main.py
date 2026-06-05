@@ -14,6 +14,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.styles import Style
 
+from pathlib import Path
+
 from openai import AuthenticationError
 
 import ui
@@ -25,6 +27,23 @@ from mcp_client import MCPManager
 from tools import register_mcp_tools
 
 _ENV_FILE = str(CONFIG_DIR / ".env")
+
+
+def _ensure_gus_dirs(cwd: str) -> None:
+    import shutil
+    root = Path(cwd)
+    for d in [".gus/skills", ".gus/commands"]:
+        (root / d).mkdir(parents=True, exist_ok=True)
+    # Copy bundled skills (shipped next to GUS source) into the working dir
+    # so they are within the sandbox when the agent tries to read them.
+    bundled = Path(__file__).parent.parent / ".gus" / "skills"
+    if bundled.is_dir():
+        for skill_dir in bundled.iterdir():
+            if not skill_dir.is_dir():
+                continue
+            dest = root / ".gus" / "skills" / skill_dir.name
+            if not dest.exists():
+                shutil.copytree(skill_dir, dest)
 
 
 class _QuitSignal(Exception):
@@ -519,7 +538,8 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
 def _sync_ctx(ctx: ProjectContext, agent: Agent) -> None:
     """Reload skills/commands from disk into ctx. Called after each turn."""
     new = load_context(agent.cwd)
-    added = [k for k in new.skills if k not in ctx.skills]
+    added_cmds   = [k for k in new.skills       if k not in ctx.skills]
+    added_skills = [k for k in new.agent_skills if k not in ctx.agent_skills]
     ctx.skills.clear()
     ctx.skills.update(new.skills)
     ctx.agent_skills.clear()
@@ -527,8 +547,12 @@ def _sync_ctx(ctx: ProjectContext, agent: Agent) -> None:
     agent._extra        = new.instructions
     agent._agent_skills = new.agent_skills
     agent.set_mode(agent.mode)
-    if added:
-        ui.print_info("  New command(s) available: " + ", ".join("/" + k for k in added))
+    if added_cmds:
+        ui.print_info("  New command(s) available: " + ", ".join("/" + k for k in added_cmds))
+    if added_skills:
+        ui.print_info("  New skill(s) available: " + ", ".join("/" + k for k in added_skills))
+    for warn in new.skill_warnings:
+        ui.print_warning(f"  Skill spec violation: {warn}")
 
 
 # ── REPL ───────────────────────────────────────────────────────────────────
@@ -758,6 +782,7 @@ def main() -> None:
         sys.exit(1)
 
     cwd   = os.path.abspath(os.path.expanduser(args.cwd))
+    _ensure_gus_dirs(cwd)
     ctx   = load_context(cwd)
     agent = Agent(client=client, model=DEFAULT_MODEL, cwd=cwd,
                   extra_instructions=ctx.instructions,
@@ -771,6 +796,8 @@ def main() -> None:
     if ctx.agent_skills:
         ui.print_info(f"  Loaded {len(ctx.agent_skills)} agent skill(s): "
                       + ", ".join("/" + s for s in ctx.agent_skills))
+    for warn in ctx.skill_warnings:
+        ui.print_warning(f"  Skill spec violation: {warn}")
 
     mcp = MCPManager(cwd)
     with ui.loading_dance("Starting MCP servers"):

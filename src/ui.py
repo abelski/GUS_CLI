@@ -656,8 +656,16 @@ def print_error(message: str) -> None:
     console.print(f"\n[bold red]Error:[/bold red] {message}")
 
 
+def print_warning(message: str) -> None:
+    console.print(f"[bold yellow]Warning:[/bold yellow] {message}")
+
+
 def print_info(message: str) -> None:
     console.print(f"[dim]{message}[/dim]")
+
+
+def print_skill_load(skill_name: str) -> None:
+    console.print(f"\n[bold magenta]  🧠 GUS load skill[/bold magenta] [bold]{skill_name}[/bold]")
 
 
 # ── Banner ─────────────────────────────────────────────────────────────────
