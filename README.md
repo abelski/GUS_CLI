@@ -27,6 +27,13 @@ chmod +x gus-macos   # or gus-linux
 ./gus-macos
 ```
 
+> **macOS Gatekeeper warning ("not opened")?**
+> The binary isn't Apple-notarized. Remove the quarantine flag once, then run normally:
+> ```bash
+> xattr -dr com.apple.quarantine gus-macos
+> ./gus-macos
+> ```
+
 **Windows:**
 
 ```
