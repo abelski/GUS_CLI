@@ -6,7 +6,7 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 
-VERSION = "0.1.0"
+VERSION = "1.1.0"
 
 
 def _get_config_dir() -> Path:
@@ -199,6 +199,9 @@ RETRY_BASE_DELAY = float(os.environ.get("AGENT_RETRY_BASE_DELAY", "1.0"))
 MAX_TOOL_WORKERS = int(os.environ.get("AGENT_MAX_TOOL_WORKERS", "8"))
 # MCP JSON-RPC response timeout (seconds).
 MCP_TIMEOUT = float(os.environ.get("AGENT_MCP_TIMEOUT", "60"))
+# URL guard: flag/re-verify links in the final answer that no tool retrieved
+# this turn (anti-fabrication backstop). Set AGENT_URL_GUARD=0 to disable.
+URL_GUARD_ENABLED = os.environ.get("AGENT_URL_GUARD", "1") != "0"
 
 LOG_FILE = os.environ.get("AGENT_LOG_FILE", str(CONFIG_DIR / "gus.log"))
 

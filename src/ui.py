@@ -759,6 +759,26 @@ def print_info(message: str) -> None:
     console.print(f"[dim]{message}[/dim]")
 
 
+def print_url_guard_checking(count: int) -> None:
+    plural = "s" if count != 1 else ""
+    console.print(
+        f"\n[dim]🔎 Verifying {count} link{plural} that no tool retrieved this turn…[/dim]"
+    )
+
+
+def print_url_guard_warning(urls: list[str]) -> None:
+    """Warn that links in the answer could not be verified as real."""
+    body = "\n".join(f"  • {u}" for u in urls)
+    console.print(Panel(
+        f"[bold {ERR}]These links were not retrieved from any source and may not "
+        f"exist:[/bold {ERR}]\n{body}\n"
+        "[dim]Treat them as unverified — GUS could not confirm they resolve.[/dim]",
+        title=f"[bold {ERR}]⚠  Unverified links[/bold {ERR}]",
+        border_style=ERR,
+        box=box.ROUNDED,
+    ))
+
+
 def print_skill_load(skill_name: str) -> None:
     console.print(f"\n[bold {PINK}]  🧠 GUS load skill[/bold {PINK}] [bold]{skill_name}[/bold]")
 

@@ -21,7 +21,6 @@ from pathlib import Path
 from openai import AuthenticationError
 
 import ui
-from prompt_toolkit.shortcuts import radiolist_dialog
 
 from config import (
     get_client, DEFAULT_MODEL, WORKING_DIR, CONFIG_DIR, MAX_GOAL_ITERATIONS,
@@ -407,6 +406,24 @@ def _apply_model(agent: Agent, model: str, persist: bool = True) -> None:
         save_env_var("AGENT_MODEL", model)
 
 
+def _switch_model_by_id(agent: Agent, model_id: str) -> None:
+    """Switch to an explicit model id from `/model <id>`. Warns and asks to
+    confirm when the id isn't in the known free-model list (likely a typo or a
+    paid model) so a fat-fingered id doesn't silently break the next turn."""
+    model_id = model_id.strip()
+    known = {mid for mid, _, _ in get_free_models()}
+    if model_id not in known:
+        ui.print_warning(
+            f"'{model_id}' isn't in the known free-model list — "
+            "it may be a paid model or a typo."
+        )
+        if not _confirm("  Switch to it anyway?"):
+            ui.print_info("  Model unchanged.")
+            return
+    _apply_model(agent, model_id)
+    ui.print_info(f"  Model switched to: {agent.model} [dim](saved to .env)[/dim]")
+
+
 def _numbered_model_select(models: list[tuple[str, str, str]],
                            current: str) -> str | None:
     """Fallback picker (numbered input) for terminals that can't run the
@@ -426,18 +443,108 @@ def _numbered_model_select(models: list[tuple[str, str, str]],
 
 def _interactive_model_select(models: list[tuple[str, str, str]],
                               current: str) -> str | None:
-    """Arrow-key selectable dialog (↑/↓ · Enter · Esc). Pre-selects the
-    current model. Returns the chosen id, or None on cancel. Falls back to a
-    numbered picker if the full-screen dialog can't be drawn."""
-    values = [(mid, f"{label}    [{mid}]    {note}") for mid, label, note in models]
-    default = current if any(mid == current for mid, _, _ in models) else None
+    """Full-screen searchable model picker (type to filter · ↑/↓ · Enter · Esc).
+    Pre-selects and scrolls to the current model, which is marked with ●.
+    Returns the chosen id, or None on cancel. Falls back to a numbered picker
+    if the full-screen application can't be drawn."""
+    from prompt_toolkit.application import Application
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
+    from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+    from prompt_toolkit.layout.dimension import Dimension
+    from prompt_toolkit.styles import Style as PTStyle
+
+    # Selection state, shared with the render/key-binding closures below.
+    state: dict = {"filtered": list(models), "index": 0}
+    for i, (mid, _, _) in enumerate(models):
+        if mid == current:
+            state["index"] = i
+            break
+
+    search = Buffer(multiline=False)
+
+    def refilter(_buf=None) -> None:
+        q = search.text.strip().lower()
+        state["filtered"] = [
+            m for m in models
+            if not q or q in m[0].lower() or q in m[1].lower() or q in m[2].lower()
+        ]
+        # Filtered set shrank — clamp the cursor so it stays in range.
+        if state["index"] >= len(state["filtered"]):
+            state["index"] = max(0, len(state["filtered"]) - 1)
+
+    search.on_text_changed += refilter
+
+    def list_fragments():
+        filt = state["filtered"]
+        if not filt:
+            return [("class:dim", "  No models match — backspace to widen the search.")]
+        frags: list[tuple[str, str]] = []
+        for i, (mid, label, note) in enumerate(filt):
+            selected = i == state["index"]
+            if selected:
+                # Magic token: makes the Window scroll to keep this row visible.
+                frags.append(("[SetCursorPosition]", ""))
+            marker = "●" if mid == current else " "
+            pointer = "❯ " if selected else "  "
+            style = "class:selected" if selected else "class:item"
+            frags.append((style, f"{pointer}{marker} {label}  [{mid}]  {note}\n"))
+        return frags
+
+    def count_text():
+        n, total = len(state["filtered"]), len(models)
+        shown = f"{n}/{total}" if n != total else str(total)
+        return [("class:dim", f"  {shown} free models · ↑/↓ move · Enter select · Esc cancel")]
+
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _(event):
+        if state["filtered"]:
+            state["index"] = (state["index"] - 1) % len(state["filtered"])
+
+    @kb.add("down")
+    def _(event):
+        if state["filtered"]:
+            state["index"] = (state["index"] + 1) % len(state["filtered"])
+
+    @kb.add("enter")
+    def _(event):
+        filt = state["filtered"]
+        event.app.exit(result=filt[state["index"]][0] if filt else None)
+
+    @kb.add("escape")
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit(result=None)
+
+    layout = Layout(HSplit([
+        Window(FormattedTextControl(
+            [("class:title", " 🦆 GUS — Select Model ")]), height=1),
+        VSplit([
+            Window(FormattedTextControl([("class:label", "  Filter: ")]),
+                   width=10, height=1),
+            Window(BufferControl(buffer=search), height=1),
+        ]),
+        Window(height=1, char="─", style="class:dim"),
+        Window(FormattedTextControl(list_fragments), wrap_lines=False,
+               height=Dimension(min=3)),
+        Window(FormattedTextControl(count_text), height=1),
+    ]))
+
+    style = PTStyle.from_dict({
+        "title": "bold #b39ddb reverse",
+        "label": "bold #5fcde4",
+        "selected": "bold #5fcde4",
+        "item": "",
+        "dim": "#888888",
+    })
+
     try:
-        return radiolist_dialog(
-            title="🦆 GUS — Select Model",
-            text="Free models from OpenRouter  ·  ↑/↓ move  ·  Enter select  ·  Esc cancel",
-            values=values,
-            default=default,
-        ).run()
+        app = Application(layout=layout, key_bindings=kb, style=style,
+                          full_screen=True, mouse_support=False)
+        return app.run()
     except Exception:
         return _numbered_model_select(models, current)
 
@@ -621,9 +728,9 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
             # No argument → picker from .env cache; `refresh` → re-fetch list.
             _pick_model(agent, refresh=bool(rest))
         else:
-            # Explicit id (e.g. /model anthropic/claude-opus-4-8) — switch and persist.
-            _apply_model(agent, rest.strip())
-            ui.print_info(f"  Model switched to: {agent.model} [dim](saved to .env)[/dim]")
+            # Explicit id (e.g. /model anthropic/claude-opus-4-8) — validate,
+            # then switch and persist.
+            _switch_model_by_id(agent, rest)
         return True
 
     # ── recap — one-line session summary ────────────────────────────────────

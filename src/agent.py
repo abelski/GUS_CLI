@@ -13,6 +13,7 @@ from openai import (
 )
 
 import ui
+import url_guard
 from config import (
     MAX_TOKENS,
     FREE_MODEL_FALLBACKS,
@@ -21,6 +22,7 @@ from config import (
     MAX_RETRIES,
     RETRY_BASE_DELAY,
     MAX_TOOL_WORKERS,
+    URL_GUARD_ENABLED,
     setup_logging,
 )
 from tools import TOOL_SCHEMAS, execute_tool, spawn_agent
@@ -47,6 +49,39 @@ Your main use case is repeatable, automated tasks that run on a schedule or in a
   artifact: never create a slash command (.gus/commands/) or a skill (.gus/skills/)
   unless the user explicitly asks you to "create a command/skill". If asked to "open a
   browser", open the browser — don't write a command that opens browsers.
+
+## Accuracy — never fabricate, always validate
+This is a hard rule and overrides the urge to be helpful or to finish quickly.
+- NEVER invent facts, data, URLs, titles, view counts, dates, prices, citations, or quotes.
+  If you did not retrieve it from a tool in THIS turn, do not present it as fact.
+- For any real-world or time-sensitive information (videos, links, news, stats, availability,
+  current events, anything that changes over time), you MUST obtain it from tools
+  (web_search, web_fetch) — never from memory or training-data recall.
+- Validate every URL before you show it: fetch it with web_fetch and confirm it actually
+  resolves and contains what you claim. Never output a link, ID, or source you have not
+  confirmed exists. There is no such thing as a "placeholder" or example URL in a real answer —
+  either it is verified, or you do not include it.
+- Cross-check claims against the source you actually retrieved. Numbers, dates, and names must
+  come from that source, not be filled in from guesswork to look complete.
+- Clearly separate what is verified (with the source/URL you fetched) from what is estimated or
+  uncertain. Never disguise an estimate as exact retrieved data.
+- If tools cannot confirm something, say so plainly — "I couldn't verify this" — rather than
+  producing plausible-looking detail. An honest "not found" beats a confident fabrication.
+
+### How to fact-check (mandatory workflow for any factual claim)
+1. Run web_search (DuckDuckGo) to find sources for the claim. Do NOT answer from memory.
+2. Prefer reliable, authoritative sources: Wikipedia, official sites and docs, primary sources
+   (the organisation/person involved), government/academic/standards bodies, and reputable news.
+   Treat forums, blogs, SEO spam, and AI-generated pages as weak — corroborate before trusting.
+3. Open the actual pages with web_fetch and read them. A search snippet alone is not verification —
+   the page must really contain the fact, and the URL must really resolve.
+4. Cross-check every important fact against at least TWO independent reliable sources. If they
+   disagree, report the disagreement instead of picking one silently.
+5. Cite the source URL (the one you fetched) next to each non-obvious fact so the user can check it.
+6. Watch for staleness: confirm the information is current/up to date, and note the date of the
+   source for anything time-sensitive (rankings, counts, prices, "latest" anything).
+Apply this to every factual or real-world question — names, numbers, events, links, history,
+definitions — not just to web-specific tasks.
 
 ## Tool use
 - Use tools for everything — do not describe what you would do, just do it.
@@ -194,6 +229,11 @@ class Agent:
 
         # last assistant text response (for /copy)
         self._last_response: str = ""
+
+        # URL guard per-turn state: URLs verified via tools/user input this
+        # turn, and whether we've already spent the one auto-correction pass.
+        self._turn_verified_urls: set[str] = set()
+        self._url_correction_done: bool = False
 
         # cumulative token usage
         self.total_input_tokens:  int = 0
@@ -466,6 +506,11 @@ class Agent:
         self._maybe_compact()
         self.history.append({"role": "user", "content": user_message})
 
+        # Seed the URL guard: links the user supplied are not fabrications, so
+        # the model may echo them. Tool results add to this set as they arrive.
+        self._turn_verified_urls = url_guard.extract_urls(user_message)
+        self._url_correction_done = False
+
         for iteration in range(1, MAX_ITERATIONS + 1):
             # Bail between iterations if the flag was tripped from another thread
             # (e.g. the REPL stopping a background routine mid-run). History is
@@ -476,8 +521,36 @@ class Agent:
 
             if not tool_calls:
                 if response_text:
+                    unverified = (
+                        url_guard.find_unverified(response_text, self._turn_verified_urls)
+                        if URL_GUARD_ENABLED else []
+                    )
+                    # First time we see fabricated-looking links, spend one
+                    # automatic pass making the model verify or drop them
+                    # instead of ending the turn on unverified URLs.
+                    if unverified and not self._url_correction_done:
+                        self._url_correction_done = True
+                        self.history.append({"role": "assistant", "content": response_text})
+                        self.history.append({
+                            "role": "user",
+                            "content": (
+                                "[Automated link check] These URLs in your answer were not "
+                                "retrieved from any tool this turn, so they may not exist:\n"
+                                + "\n".join(f"  - {u}" for u in unverified)
+                                + "\n\nFor EACH one, call web_fetch to confirm it resolves. "
+                                "Keep a URL only if the fetch succeeds; remove any that error "
+                                "or 404. Do not invent replacement URLs. If you cannot verify a "
+                                "link, drop it and say so. Then give your corrected final answer."
+                            ),
+                        })
+                        ui.print_url_guard_checking(len(unverified))
+                        continue
                     self._last_response = response_text
                     self.history.append({"role": "assistant", "content": response_text})
+                    # Survived a correction pass and still has unverified links —
+                    # warn the user rather than letting them be trusted silently.
+                    if unverified:
+                        ui.print_url_guard_warning(unverified)
                     ui.print_gus_done()
                 else:
                     # Model returned neither text nor a tool call — nothing
@@ -527,6 +600,10 @@ class Agent:
                     "tool_call_id": tc["id"],
                     "content": result,
                 })
+                # Record URLs this tool genuinely surfaced so the guard can
+                # tell them apart from links the model invents.
+                self._turn_verified_urls |= url_guard.verified_urls_from_tool(
+                    tc["name"], tc["arguments"], result)
 
             if interrupted:
                 ui.console.print(

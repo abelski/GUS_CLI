@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import setup_logging, MCP_TIMEOUT
+from config import setup_logging, MCP_TIMEOUT, VERSION
 
 log = setup_logging()
 
@@ -78,7 +78,7 @@ class _MCPServer:
         resp = self._send("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {"tools": {}},
-            "clientInfo": {"name": "gus", "version": "0.1.0"},
+            "clientInfo": {"name": "gus", "version": VERSION},
         })
         if resp is None:
             raise RuntimeError(f"MCP server '{self.name}' did not respond to initialize")
