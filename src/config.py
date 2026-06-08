@@ -48,20 +48,29 @@ def save_env_var(name: str, value: str) -> None:
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 # Always-available catch-all: OpenRouter routes this to a working free model.
-# Used as the startup default and as the last-resort 429 fallback.
+# Used as the last-resort fallback when every named model is unavailable.
 FALLBACK_MODEL = "openrouter/free"
 
-DEFAULT_MODEL = os.environ.get("AGENT_MODEL", FALLBACK_MODEL)
+# Startup default. A tool-tuned coder model with a 1M context window — far more
+# reliable at function-calling (which every agent turn depends on) than the
+# generic auto-router. Override with AGENT_MODEL.
+PRIMARY_MODEL = "qwen/qwen3-coder:free"
 
+DEFAULT_MODEL = os.environ.get("AGENT_MODEL", PRIMARY_MODEL)
+
+# Fallback chain tried in order when a model errors. Ordered for free-tier use:
+# every entry supports tool-calling, and the list spans distinct providers
+# (Qwen, OpenAI, Z-AI, Meta, Moonshot) so a per-provider rate-limit or outage on
+# one doesn't sink the others. The auto-router is pinned last as a catch-all.
 _DEFAULT_FALLBACKS = ",".join([
-    "google/gemma-4-31b-it:free",
-    "openai/gpt-oss-120b:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
     "qwen/qwen3-coder:free",
+    "openai/gpt-oss-120b:free",
+    "z-ai/glm-4.5-air:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
     "moonshotai/kimi-k2.6:free",
     FALLBACK_MODEL,
 ])
-# Tried in order when a model returns 429; override with AGENT_FREE_MODEL_FALLBACKS (comma-separated)
+# Override with AGENT_FREE_MODEL_FALLBACKS (comma-separated)
 FREE_MODEL_FALLBACKS = [
     m.strip()
     for m in os.environ.get("AGENT_FREE_MODEL_FALLBACKS", _DEFAULT_FALLBACKS).split(",")
@@ -195,6 +204,15 @@ COMPACT_THRESHOLD_TOKENS = int(os.environ.get("AGENT_COMPACT_THRESHOLD", "100000
 # Transient-error retry policy for model calls.
 MAX_RETRIES = int(os.environ.get("AGENT_MAX_RETRIES", "3"))
 RETRY_BASE_DELAY = float(os.environ.get("AGENT_RETRY_BASE_DELAY", "1.0"))
+# Free-tier rate-limit (429) policy. OpenRouter caps :free models at ~20
+# requests/min account-wide, so when every model is rate-limited the only cure
+# is to wait for the window to reset rather than spray more requests. After a
+# full pass where all models 429, GUS waits (honouring the reset header, capped
+# at MAX_WAIT) and retries the chain up to RATELIMIT_ROUNDS times.
+RATELIMIT_MAX_WAIT = float(os.environ.get("AGENT_RATELIMIT_MAX_WAIT", "60"))
+RATELIMIT_ROUNDS = int(os.environ.get("AGENT_RATELIMIT_ROUNDS", "3"))
+# Wait used when the 429 carries no usable reset/Retry-After header.
+RATELIMIT_DEFAULT_WAIT = float(os.environ.get("AGENT_RATELIMIT_DEFAULT_WAIT", "12"))
 # Cap on concurrent worker threads when a turn emits many tool calls.
 MAX_TOOL_WORKERS = int(os.environ.get("AGENT_MAX_TOOL_WORKERS", "8"))
 # MCP JSON-RPC response timeout (seconds).

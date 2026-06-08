@@ -7,8 +7,6 @@ import threading
 import time
 from rich.console import Console
 from rich.live import Live
-from rich.markdown import Markdown
-from rich.padding import Padding
 from rich.panel import Panel
 from rich.status import Status
 from rich.table import Table
@@ -34,13 +32,6 @@ console = Console(highlight=False)
 console_lock = threading.Lock()
 _subagent_depth_lock = threading.Lock()
 
-
-def _md(text: str) -> Padding:
-    """Render markdown with a consistent code theme, left-indented for readability."""
-    return Padding(
-        Markdown(text, code_theme="monokai", hyperlinks=False),
-        pad=(0, 0, 0, 2),
-    )
 
 # ── Thinking spinner ───────────────────────────────────────────────────────
 
@@ -383,22 +374,19 @@ def print_assistant_start() -> None:
     global _live_render, _live_text
     console.print(f"\n[bold {BRAND}]GUS[/bold {BRAND}]")
     _live_text = ""
-    _live_render = Live(
-        _md(""),
-        console=console,
-        vertical_overflow="visible",
-        refresh_per_second=8,
-    )
-    _live_render.start()
+    # Stream append-only (no Rich Live). A Live region re-renders the whole
+    # accumulated text on every chunk by moving the cursor up over the previous
+    # frame; once the answer grows taller than the terminal, Rich can no longer
+    # reach the top of the region and leaves every intermediate frame behind in
+    # the scrollback (the cascading-duplicate-text bug). Append-only streaming
+    # never moves the cursor up, so long answers print exactly once.
+    _live_render = None
 
 
 def print_assistant_chunk(text: str) -> None:
     global _live_text
-    if _live_render is not None:
-        _live_text += text
-        _live_render.update(_md(_live_text))
-    else:
-        console.print(text, end="", markup=False)
+    _live_text += text
+    console.print(text, end="", markup=False, highlight=False)
 
 
 def handle_resize() -> None:
@@ -434,14 +422,10 @@ def handle_resize() -> None:
 
 def print_assistant_end() -> None:
     global _live_render, _live_text
-    if _live_render is not None:
-        # Final render with complete text, then stop
-        _live_render.update(_md(_live_text))
-        _live_render.stop()
-        _live_render = None
-        _live_text = ""
-    else:
-        console.print()
+    # Append-only streaming printed the text already; just close the line.
+    _live_render = None
+    _live_text = ""
+    console.print()
 
 
 # ── Tool display ───────────────────────────────────────────────────────────
