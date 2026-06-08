@@ -5,3 +5,9 @@ python-dotenv>=1.0.0
 ddgs>=0.1.0
 PyYAML>=6.0
 certifi>=2023.0.0
+
+# Optional — only needed for the `browser` tool (JS/SPA pages, button-triggered
+# downloads). GUS runs fine without it. Install on demand:
+#   python3 -m pip install playwright
+#   python3 -m playwright install chromium
+# playwright>=1.40.0

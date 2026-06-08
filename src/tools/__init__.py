@@ -3,7 +3,7 @@ from typing import Any
 from ._exceptions import ToolInterrupted
 from . import (
     read_file, write_file, edit_file, bash, glob, grep, list_dir,
-    web_search, web_fetch,
+    web_search, web_fetch, browser,
     spawn_agent, monitor,
     todo_write,
     task_create, task_list, task_get, task_update,
@@ -12,7 +12,7 @@ from . import (
 
 _TOOLS = [
     read_file, write_file, edit_file, bash, glob, grep, list_dir,
-    web_search, web_fetch,
+    web_search, web_fetch, browser,
     spawn_agent, monitor,
     todo_write,
     task_create, task_list, task_get, task_update,

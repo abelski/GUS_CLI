@@ -79,6 +79,7 @@ _BUILTIN_COMMANDS: list[tuple[str, str]] = [
     ("/model",         "pick model from list (or /model <id>)"),
     ("/settings",      "settings screen (model selection)"),
     ("/findings",      "view, clear, or toggle the findings memory"),
+    ("/log",           "show this session's log path and recent entries"),
     ("/usage",         "token usage and session stats"),
     ("/cost",          "token usage and session stats"),
     ("/stats",         "token usage and session stats"),
@@ -594,6 +595,26 @@ def _refresh_findings_prompt(agent: Agent) -> None:
     agent.set_mode(agent.mode)  # rebuild the system prompt with the new findings text
 
 
+def _handle_log(rest: str, agent: Agent) -> None:
+    """`/log [N]` — show the session-log path and its last N lines (default 30)."""
+    if agent.session_log is None:
+        ui.print_info("  Session logging is off (set AGENT_SESSION_LOG=1 to enable).")
+        return
+    path = agent.session_log.path
+    ui.print_info(f"  Session log: {path}")
+    try:
+        n = int(rest.strip()) if rest.strip() else 30
+    except ValueError:
+        n = 30
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        ui.print_info("  (nothing logged yet)")
+        return
+    tail = "\n".join(lines[-n:])
+    ui.console.print(tail)
+
+
 def _handle_findings(rest: str, agent: Agent) -> None:
     """`/findings [list|on|off|clear]` — manage the persistent findings memory."""
     arg = rest.strip().lower()
@@ -720,6 +741,11 @@ def handle_slash_command(raw: str, agent: Agent, ctx: ProjectContext,
     # ── findings — view / clear / toggle the persistent findings memory ──────
     if command == "/findings":
         _handle_findings(rest, agent)
+        return True
+
+    # ── log — show the session transcript path and recent lines ──────────────
+    if command == "/log":
+        _handle_log(rest, agent)
         return True
 
     # ── model — open picker, or switch directly with an explicit id ──────────
@@ -1189,12 +1215,19 @@ def main() -> None:
     agent = Agent(client=client, model=DEFAULT_MODEL, cwd=cwd,
                   extra_instructions=ctx.instructions,
                   agent_skills=ctx.agent_skills,
-                  findings_text=findings_text)
+                  findings_text=findings_text,
+                  enable_session_log=True)
 
     if ctx.instructions:
         ui.print_info(f"  Loaded agents.md ({len(ctx.instructions)} chars)")
     if findings_text:
         ui.print_info(f"  Loaded findings memory ({len(findings_text)} chars)")
+    if agent.session_log:
+        try:
+            rel = os.path.relpath(agent.session_log.path, cwd)
+        except ValueError:
+            rel = str(agent.session_log.path)
+        ui.print_info(f"  Session log: {rel}")
     if ctx.skills:
         ui.print_info(f"  Loaded {len(ctx.skills)} command(s): "
                       + ", ".join("/" + s for s in ctx.skills))

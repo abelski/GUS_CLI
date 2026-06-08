@@ -14,6 +14,7 @@ from openai import (
 
 import ui
 import url_guard
+from session_log import SessionLogger, session_log_enabled
 from config import (
     MAX_TOKENS,
     FREE_MODEL_FALLBACKS,
@@ -103,8 +104,14 @@ _BASE_SYSTEM_PROMPT = """\
 You are GUS (General-purpose Utility Shell), an autonomous AI agent running in a
 terminal and powered by models served through OpenRouter. You have tools to read,
 write, and edit files, run shell commands, search codebases (glob, grep, list_dir),
-search and fetch the web (web_search, web_fetch), spawn sub-agents (spawn_agent), and
-— unless disabled — ask the user a question (ask_user).
+search and fetch the web (web_search, web_fetch), drive a real headless browser for
+JavaScript/SPA pages and button-triggered downloads (browser), spawn sub-agents
+(spawn_agent), and — unless disabled — ask the user a question (ask_user).
+
+When a page needs JavaScript to render (a React/Vue/Angular single-page app) or the task
+requires clicking a button, filling a form, or downloading a file behind a click, use the
+`browser` tool — `web_fetch` only retrieves static HTML and will see an empty shell on such
+sites. Reserve `web_fetch` for simple static pages.
 
 You operate as a command-line coding and automation agent: developers and scripts
 delegate tasks to you directly from their terminal, often unattended. The active model,
@@ -346,7 +353,7 @@ class Agent:
     def __init__(self, client: OpenAI, model: str, cwd: str,
                  extra_instructions: str = "", mode: str = "agent",
                  agent_skills: dict | None = None,
-                 findings_text: str = "") -> None:
+                 findings_text: str = "", enable_session_log: bool = False) -> None:
         self.client        = client
         self.model         = model
         self.cwd           = cwd
@@ -357,6 +364,16 @@ class Agent:
         self.system_prompt = _build_system_prompt(extra_instructions, mode,
                                                   self._agent_skills, findings_text)
         self.history: list[dict] = []
+
+        # Per-project session transcript (interactive/one-shot agent only;
+        # forks for routines and sub-agents stay quiet to avoid noise).
+        self.session_log = None
+        if enable_session_log and session_log_enabled():
+            try:
+                self.session_log = SessionLogger(cwd, model)
+            except Exception:
+                self.session_log = None
+        self._turn_tool_calls = 0
 
         # session metadata
         self.session_name: str = ""
@@ -564,8 +581,12 @@ class Agent:
                 )
                 ui.print_tool_result(tc["name"], msg, error=True)
                 log.error("tool %s: bad JSON args: %s", tc["name"], raw_args[:200])
+                if self.session_log:
+                    self.session_log.tool_result(tc["name"], msg, is_error=True)
                 return tc, msg, False
         log.debug("tool call: %s  args=%s", tc["name"], json.dumps(args))
+        if self.session_log:
+            self.session_log.tool_call(tc["name"], args)
         # Skill activation — show a clean banner, suppress the raw read_file output
         _is_skill_load = (
             tc["name"] == "read_file"
@@ -583,6 +604,8 @@ class Agent:
             msg = str(exc)
             ui.console.print(f"\n[dim]*{msg}*[/dim]")
             log.debug("tool interrupted: %s", tc["name"])
+            if self.session_log:
+                self.session_log.tool_result(tc["name"], msg, is_error=True)
             return tc, msg, True
         is_error = result.startswith("Error:")
         if not _is_skill_load:
@@ -591,6 +614,8 @@ class Agent:
             log.error("tool %s failed: %s", tc["name"], result)
         else:
             log.debug("tool result: %s  → %s", tc["name"], result[:200])
+        if self.session_log:
+            self.session_log.tool_result(tc["name"], result, is_error=is_error)
         return tc, result, False
 
     def _run_tools(self, tool_calls: list[dict]) -> tuple[list[tuple[dict, str, bool]], bool]:
@@ -636,6 +661,19 @@ class Agent:
         return results, interrupted
 
     def run_turn(self, user_message: str) -> None:
+        """Thin wrapper: record the turn in the session log, then run it."""
+        if self.session_log:
+            self.session_log.user(user_message)
+        self._turn_tool_calls = 0
+        _turn_started = time.time()
+        try:
+            self._run_turn_inner(user_message)
+        finally:
+            if self.session_log:
+                self.session_log.turn_end(
+                    self._turn_tool_calls, self.model, time.time() - _turn_started)
+
+    def _run_turn_inner(self, user_message: str) -> None:
         self.total_turns += 1
         clear_interrupt()
         self._maybe_compact()
@@ -682,6 +720,8 @@ class Agent:
                         continue
                     self._last_response = response_text
                     self.history.append({"role": "assistant", "content": response_text})
+                    if self.session_log:
+                        self.session_log.assistant(response_text)
                     # Survived a correction pass and still has unverified links —
                     # warn the user rather than letting them be trusted silently.
                     if unverified:
@@ -727,6 +767,7 @@ class Agent:
                 ],
             })
 
+            self._turn_tool_calls += len(tool_calls)
             exec_results, interrupted = self._run_tools(tool_calls)
 
             for tc, result, _ in exec_results:
@@ -764,6 +805,13 @@ class Agent:
     def _models_to_try(self) -> list[str]:
         return [self.model] + [m for m in FREE_MODEL_FALLBACKS if m != self.model]
 
+    def _trace_model(self, msg: str, style: str = "dim") -> None:
+        """Surface a model fallback / retry transition to the console (so the
+        user can see GUS switching models) and record it in the session log."""
+        ui.console.print(f"[{style}]  ↻ {msg}[/{style}]")
+        if self.session_log:
+            self.session_log.event(msg)
+
     def _stream_response(self) -> tuple[str, list[dict]]:
         """Stream a model response, resilient to free-tier limits.
 
@@ -782,7 +830,12 @@ class Agent:
             for model in self._models_to_try():
                 for attempt in range(MAX_RETRIES):
                     try:
-                        return self._call_model(model)
+                        result = self._call_model(model)
+                        # Tell the user when a fallback model (not the chosen one)
+                        # ended up serving the response.
+                        if model != self.model:
+                            self._trace_model(f"served by fallback model {model}", "green")
+                        return result
                     except RateLimitError as e:
                         last_error = e
                         rl_wait = _rate_limit_wait_seconds(e) or rl_wait
@@ -791,7 +844,9 @@ class Agent:
                             # Account-wide cap — other :free models are capped
                             # too, so stop rotating and go straight to the wait.
                             global_limit = True
+                            self._trace_model(f"{model}: account-wide free rate limit hit", "yellow")
                             break
+                        self._trace_model(f"{model} rate-limited — trying next model", "yellow")
                         break  # per-model limit: try the next model
                     except _TRANSIENT_ERRORS as e:
                         last_error = e
@@ -800,14 +855,22 @@ class Agent:
                         log.warning("transient error on %s (attempt %d/%d): %s — retrying in %.1fs",
                                     model, attempt + 1, MAX_RETRIES, e, delay)
                         if attempt + 1 < MAX_RETRIES:
+                            self._trace_model(
+                                f"{model}: {type(e).__name__} — retry "
+                                f"{attempt + 1}/{MAX_RETRIES} in {delay:.0f}s", "yellow")
                             if not _sleep_interruptible(delay):
                                 raise
+                        else:
+                            self._trace_model(
+                                f"{model}: {type(e).__name__} — giving up on this model, "
+                                "trying next", "yellow")
                     except Exception as e:
                         # Non-transient (e.g. model-not-found 404, bad request) —
                         # don't retry this model, try the next fallback instead.
                         last_error = e
                         all_rate_limited = False
                         log.warning("error on %s: %s — trying next model", model, e)
+                        self._trace_model(f"{model}: {str(e)[:120]} — trying next model", "red")
                         break
                 if global_limit:
                     break
@@ -821,6 +884,10 @@ class Agent:
                 f"  All free models rate-limited — waiting {wait:.0f}s for the "
                 f"limit to reset (round {round_idx + 1}/{RATELIMIT_ROUNDS})…"
             )
+            if self.session_log:
+                self.session_log.event(
+                    f"all models rate-limited — waiting {wait:.0f}s "
+                    f"(round {round_idx + 1}/{RATELIMIT_ROUNDS})")
             if not _sleep_interruptible(wait):
                 break  # user interrupted the wait — surface the last error
 
